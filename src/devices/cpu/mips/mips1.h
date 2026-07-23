@@ -49,6 +49,7 @@ protected:
 	virtual void handle_cop1(u32 const op);
 	virtual void handle_cop2(u32 const op);
 	virtual void handle_cop3(u32 const op);
+	virtual void handle_cache(u32 const op);
 
 	// load/store left/right opcodes
 	void lwl(u32 const op);
@@ -249,6 +250,16 @@ public:
 	r3081_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock, size_t icache_size = 16384, size_t dcache_size = 4096);
 };
 
+class r3900_device : public mips1core_device_base
+{
+public:
+	r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
+
+protected:
+	virtual translate_result translate(int intention, offs_t &address, bool debug) override;
+	virtual void handle_cache(u32 const op) override;
+};
+
 class iop_device : public mips1core_device_base
 {
 public:
@@ -265,6 +276,7 @@ DECLARE_DEVICE_TYPE(R3052,       r3052_device)
 DECLARE_DEVICE_TYPE(R3052E,      r3052e_device)
 DECLARE_DEVICE_TYPE(R3071,       r3071_device)
 DECLARE_DEVICE_TYPE(R3081,       r3081_device)
+DECLARE_DEVICE_TYPE(R3900,       r3900_device)
 DECLARE_DEVICE_TYPE(SONYPS2_IOP, iop_device)
 
 #endif // MAME_CPU_MIPS_MIPS1_H
