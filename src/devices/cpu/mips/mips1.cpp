@@ -206,6 +206,7 @@ DEFINE_DEVICE_TYPE(R3052,       r3052_device,     "r3052",   "IDT R3052")
 DEFINE_DEVICE_TYPE(R3052E,      r3052e_device,    "r3052e",  "IDT R3052E")
 DEFINE_DEVICE_TYPE(R3071,       r3071_device,     "r3071",   "IDT R3071")
 DEFINE_DEVICE_TYPE(R3081,       r3081_device,     "r3081",   "IDT R3081")
+DEFINE_DEVICE_TYPE(R3900,       r3900_device,     "r3900",    "Toshiba R3900")
 DEFINE_DEVICE_TYPE(SONYPS2_IOP, iop_device,       "sonyiop", "Sony Playstation 2 IOP")
 
 ALLOW_SAVE_TYPE(mips1core_device_base::branch_state);
@@ -280,6 +281,11 @@ r3081_device::r3081_device(machine_config const &mconfig, char const *tag, devic
 	: mips1_device_base(mconfig, R3081, tag, owner, clock, 0x0200, icache_size, dcache_size, true)
 {
 	set_fpu(0x0300);
+}
+
+r3900_device::r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true)
+{
 }
 
 iop_device::iop_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -704,6 +710,9 @@ void mips1core_device_base::execute_run()
 			case 0x2e: // SWR
 				swr(op);
 				break;
+			case 0x2f: // CACHE
+				handle_cache(op);
+				break;
 			case 0x31: // LWC1
 				handle_cop1(op);
 				break;
@@ -815,6 +824,45 @@ mips1core_device_base::translate_result mips1core_device_base::translate(int int
 		address += 0x40000000;
 
 	return m_cache;
+}
+
+mips1core_device_base::translate_result r3900_device::translate(int intention, offs_t &address, bool debug)
+{
+	// The R3900 has no TLB.  Unlike the IDT-derived embedded cores above,
+	// its kuseg addresses map directly to the corresponding physical address.
+	if (!BIT(address, 31))
+		return m_cache;
+
+	return mips1core_device_base::translate(intention, address, debug);
+}
+
+void r3900_device::handle_cache(u32 const op)
+{
+	offs_t address = m_r[RSREG] + SIMMVAL;
+
+	switch (RTREG)
+	{
+	case 0x00: // instruction cache index invalidate
+		std::get<0>(cache_lookup(address, false, true)).invalidate();
+		break;
+
+	case 0x05: // data cache index LRU bit clear
+		// MAME's current MIPS-I cache model is direct-mapped.
+		break;
+
+	case 0x11: // data cache hit invalidate
+		if (translate(TR_READ, address, false) == CACHED)
+		{
+			auto [line, miss] = cache_lookup(address, false);
+			if (!miss)
+				line.invalidate();
+		}
+		break;
+
+	default:
+		generate_exception(EXCEPTION_INVALIDOP);
+		break;
+	}
 }
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
@@ -960,6 +1008,11 @@ void mips1core_device_base::handle_cop1(u32 const op)
 {
 	if (!(SR & SR_COP1))
 		generate_exception(EXCEPTION_BADCOP1);
+}
+
+void mips1core_device_base::handle_cache(u32 const)
+{
+	generate_exception(EXCEPTION_INVALIDOP);
 }
 
 void mips1core_device_base::handle_cop2(u32 const op)

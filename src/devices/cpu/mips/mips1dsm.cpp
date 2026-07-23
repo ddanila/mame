@@ -376,6 +376,7 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 		case 0x2a:  util::stream_format(stream, "swl    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x2b:  util::stream_format(stream, "sw     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x2e:  util::stream_format(stream, "swr    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
+		case 0x2f:  util::stream_format(stream, "cache  0x%x,%s(%s)", rt, signed_16bit(op), reg[rs]);            break;
 		case 0x31:  util::stream_format(stream, "lwc1   %s,%s(%s)", cpreg[1][rt], signed_16bit(op), reg[rs]);   break;
 		case 0x32:  util::stream_format(stream, "lwc2   %s,%s(%s)", cpreg[2][rt], signed_16bit(op), reg[rs]);   break;
 		case 0x33:  util::stream_format(stream, "lwc3   %s,%s(%s)", cpreg[3][rt], signed_16bit(op), reg[rs]);   break;
