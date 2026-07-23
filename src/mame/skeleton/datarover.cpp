@@ -25,7 +25,7 @@
     TODO:
       - add the remaining TX39-specific CP0 and MAC behaviour
       - replace Dino register shadows with functional devices
-      - connect sound, modem and PC Card slots
+      - connect modem and PC Card slots
 
 ***************************************************************************/
 
@@ -34,8 +34,10 @@
 #include "cpu/mips/mips1.h"
 #include "machine/nvram.h"
 #include "machine/terminal.h"
+#include "sound/dmadac.h"
 
 #include "screen.h"
+#include "speaker.h"
 
 #include "datarover840.lh"
 
@@ -52,6 +54,7 @@ public:
 		, m_maincpu(*this, "maincpu")
 		, m_screen(*this, "screen")
 		, m_terminal(*this, "terminal")
+		, m_dmadac(*this, "speaker_dac")
 		, m_rtc_nvram(*this, "rtc")
 		, m_ram(*this, "ram")
 		, m_rom(*this, "maincpu")
@@ -80,6 +83,7 @@ private:
 	static constexpr u32 DINO_SIB_SF1_AUX = 0x084 / 4;
 	static constexpr u32 DINO_SIB_SF0_STATUS = 0x088 / 4;
 	static constexpr u32 DINO_SIB_SF1_STATUS = 0x08c / 4;
+	static constexpr u32 DINO_SIB_SOUND_HOLD = 0x078 / 4;
 	static constexpr u32 DINO_SIB_CONTROL = 0x074 / 4;
 	static constexpr u32 DINO_VIDEO_HIGH_BUFFER = 0x030 / 4;
 	static constexpr u32 DINO_MBUS_CONTROL1 = 0x0e0 / 4;
@@ -122,6 +126,7 @@ private:
 	void uart_hold_w(unsigned channel, u32 data, u32 mem_mask);
 	void terminal_key(u8 data);
 	void update_irq();
+	void update_sib_timers();
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -131,11 +136,13 @@ private:
 	TIMER_CALLBACK_MEMBER(rtc_rollover);
 	TIMER_CALLBACK_MEMBER(rtc_persist_tick);
 	TIMER_CALLBACK_MEMBER(sib_tick);
+	TIMER_CALLBACK_MEMBER(sound_tick);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 
 	required_device<r3900_device> m_maincpu;
 	required_device<screen_device> m_screen;
 	required_device<generic_terminal_device> m_terminal;
+	required_device<dmadac_sound_device> m_dmadac;
 	required_device<nvram_device> m_rtc_nvram;
 	required_shared_ptr<u32> m_ram;
 	required_region_ptr<u32> m_rom;
@@ -159,6 +166,7 @@ private:
 	emu_timer *m_rtc_rollover_timer = nullptr;
 	emu_timer *m_rtc_persist_timer = nullptr;
 	emu_timer *m_sib_timer = nullptr;
+	emu_timer *m_sound_timer = nullptr;
 };
 
 
@@ -390,6 +398,7 @@ INPUT_CHANGED_MEMBER(datarover_state::power_changed)
 			m_dino[DINO_SIB_SF1_STATUS] = 0;
 			m_dino[DINO_INTERRUPT1] &= ~0x0000'05e0;
 			m_sib_timer->reset();
+			m_sound_timer->reset();
 			m_dino[DINO_POWER_CONTROL] |= 0x0000'0001;
 			m_dino[DINO_POWER_CONTROL] &= ~0x0000'0010;
 			m_maincpu->resume(SUSPEND_REASON_HALT);
@@ -437,6 +446,32 @@ void datarover_state::update_irq()
 
 	// Dino's general interrupt is IP4 (Cause bit 12), MIPS input line 2.
 	m_maincpu->set_input_line(2, pending ? ASSERT_LINE : CLEAR_LINE);
+}
+
+
+void datarover_state::update_sib_timers()
+{
+	bool const sib_enabled = BIT(m_dino[DINO_SIB_CONTROL], 0);
+	if (sib_enabled)
+		m_sib_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+	else
+		m_sib_timer->reset();
+
+	// Dino derives the sound sample clock from the 9.216 MHz SIB clock.
+	// Its 32-bit hold register carries two signed 16-bit mono samples, so
+	// the FIFO-full service interrupt occurs at half the sample frequency.
+	if (sib_enabled && BIT(m_dino[DINO_SIB_CONTROL], 4))
+	{
+		unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 8, 7) + 1;
+		double const sample_rate = 9'216'000.0 / (32.0 * divisor);
+		attotime const interval = attotime::from_hz(sample_rate / 2.0);
+		m_dmadac->set_frequency(sample_rate);
+		m_sound_timer->adjust(interval, 0, interval);
+	}
+	else
+	{
+		m_sound_timer->reset();
+	}
 }
 
 
@@ -541,10 +576,21 @@ TIMER_CALLBACK_MEMBER(datarover_state::sib_tick)
 {
 	if (BIT(m_dino[DINO_SIB_CONTROL], 0))
 	{
-		// Betty's serial bus continually produces frame boundaries and sound
-		// receive slots.  Schedule them rather than reasserting immediately
-		// on clear, allowing the interrupt handler to make forward progress.
-		m_dino[DINO_INTERRUPT1] |= 0x0000'0580;
+		// Betty's serial bus continually produces subframe boundaries.
+		// Schedule them rather than reasserting immediately on clear, allowing
+		// the interrupt handler to make forward progress.
+		m_dino[DINO_INTERRUPT1] |= 0x0000'0180;
+		update_irq();
+	}
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
+{
+	if (BIT(m_dino[DINO_SIB_CONTROL], 0) && BIT(m_dino[DINO_SIB_CONTROL], 4))
+	{
+		// One 32-bit sound-hold slot (two 16-bit samples) is available.
+		m_dino[DINO_INTERRUPT1] |= 0x0000'0400;
 		update_irq();
 	}
 }
@@ -623,12 +669,22 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		COMBINE_DATA(&m_dino[offset]);
 		if (BIT(m_dino[offset], 0))
 		{
-			m_dino[DINO_INTERRUPT1] |= 0x0000'0580;
-			m_sib_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
+			m_dino[DINO_INTERRUPT1] |= 0x0000'0180;
+			if (BIT(m_dino[offset], 4))
+				m_dino[DINO_INTERRUPT1] |= 0x0000'0400;
 		}
-		else
+		update_sib_timers();
+		break;
+
+	case DINO_SIB_SOUND_HOLD:
+		COMBINE_DATA(&m_dino[offset]);
+		if (ACCESSING_BITS_0_31 && BIT(m_betty[8], 15))
 		{
-			m_sib_timer->reset();
+			std::array<s16, 2> samples{
+					s16(m_dino[offset] >> 16),
+					s16(m_dino[offset]) };
+			m_dmadac->flush();
+			m_dmadac->transfer(0, 1, 1, samples.size(), samples.data());
 		}
 		break;
 
@@ -758,7 +814,10 @@ void datarover_state::machine_start()
 	m_rtc_rollover_timer = timer_alloc(FUNC(datarover_state::rtc_rollover), this);
 	m_rtc_persist_timer = timer_alloc(FUNC(datarover_state::rtc_persist_tick), this);
 	m_sib_timer = timer_alloc(FUNC(datarover_state::sib_tick), this);
+	m_sound_timer = timer_alloc(FUNC(datarover_state::sound_tick), this);
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
+	m_dmadac->set_frequency(11'025);
+	m_dmadac->enable(1);
 
 	save_item(NAME(m_dino));
 	save_item(NAME(m_glacier1));
@@ -795,6 +854,10 @@ void datarover_state::machine_reset()
 	m_rtc_rollover_timer->reset();
 	m_rtc_persist_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
 	m_sib_timer->reset();
+	m_sound_timer->reset();
+	m_dmadac->enable(0);
+	m_dmadac->set_frequency(11'025);
+	m_dmadac->enable(1);
 
 	static constexpr u32 RTC_NVRAM_SIGNATURE = 0x4452'5443; // "DRTC"
 	static constexpr u64 RTC_MASK = 0x0000'00ff'ffff'ffff;
@@ -872,6 +935,9 @@ void datarover_state::datarover840(machine_config &config)
 
 	GENERIC_TERMINAL(config, m_terminal);
 	m_terminal->set_keyboard_callback(FUNC(datarover_state::terminal_key));
+
+	SPEAKER(config, "speaker").front_center();
+	DMADAC(config, m_dmadac).add_route(ALL_OUTPUTS, "speaker", 0.5);
 }
 
 
@@ -884,4 +950,4 @@ ROM_END
 
 
 //    YEAR  NAME          PARENT  COMPAT  MACHINE       INPUT         CLASS             INIT        COMPANY          FULLNAME        FLAGS
-COMP( 1998, datarover840, 0,      0,      datarover840, datarover840, datarover_state, empty_init, "General Magic", "DataRover 840", MACHINE_NO_SOUND | MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840, 0,      0,      datarover840, datarover840, datarover_state, empty_init, "General Magic", "DataRover 840", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
