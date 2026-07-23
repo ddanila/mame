@@ -364,6 +364,29 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 		case 0x11:  flags = dasm_cop1(pc, op, stream);                                          break;
 		case 0x12:  flags = dasm_cop(pc, 2, op, stream);                                            break;
 		case 0x13:  flags = dasm_cop(pc, 3, op, stream);                                            break;
+		case 0x1c:
+			if (shift)
+			{
+				util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+			}
+			else
+			{
+				switch (op & 63)
+				{
+					case 0x00:  if (rd == 0)
+								util::stream_format(stream, "madd   %s,%s", reg[rs], reg[rt]);
+								else
+								util::stream_format(stream, "madd   %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+						break;
+					case 0x01:  if (rd == 0)
+								util::stream_format(stream, "maddu  %s,%s", reg[rs], reg[rt]);
+								else
+								util::stream_format(stream, "maddu  %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+						break;
+					default:    util::stream_format(stream, ".word  0x%08x /*invalid*/", op);                       break;
+				}
+			}
+			break;
 		case 0x20:  util::stream_format(stream, "lb     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x21:  util::stream_format(stream, "lh     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x22:  util::stream_format(stream, "lwl    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;

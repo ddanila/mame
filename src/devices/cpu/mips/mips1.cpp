@@ -674,6 +674,9 @@ void mips1core_device_base::execute_run()
 			case 0x13: // COP3
 				handle_cop3(op);
 				break;
+			case 0x1c: // R3900 MADD/MADDU
+				handle_special2(op);
+				break;
 			case 0x20: // LB
 				load<u8>(SIMMVAL + m_r[RSREG], [this, op](s8 temp) { m_r[RTREG] = temp; });
 				break;
@@ -863,6 +866,46 @@ void r3900_device::handle_cache(u32 const op)
 		generate_exception(EXCEPTION_INVALIDOP);
 		break;
 	}
+}
+
+void mips1core_device_base::handle_special2(u32 const op)
+{
+	generate_exception(EXCEPTION_INVALIDOP);
+}
+
+void r3900_device::handle_special2(u32 const op)
+{
+	if (BIT(op, 6, 5))
+	{
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	u64 const accumulator = (u64(m_hi) << 32) | m_lo;
+	u64 product;
+
+	switch (op & 63)
+	{
+	case 0x00: // MADD
+		product = mul_32x32(m_r[RSREG], m_r[RTREG]);
+		break;
+
+	case 0x01: // MADDU
+		product = mulu_32x32(m_r[RSREG], m_r[RTREG]);
+		break;
+
+	default:
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	u64 const result = accumulator + product;
+	m_lo = u32(result);
+	m_hi = u32(result >> 32);
+	m_r[RDREG] = m_lo;
+
+	// TX39 MADD/MADDU use the two-stage multiply/add execution unit.
+	m_icount--;
 }
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()

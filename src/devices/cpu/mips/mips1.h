@@ -49,6 +49,7 @@ protected:
 	virtual void handle_cop1(u32 const op);
 	virtual void handle_cop2(u32 const op);
 	virtual void handle_cop3(u32 const op);
+	virtual void handle_special2(u32 const op);
 	virtual void handle_cache(u32 const op);
 
 	// load/store left/right opcodes
@@ -257,6 +258,7 @@ public:
 
 protected:
 	virtual translate_result translate(int intention, offs_t &address, bool debug) override;
+	virtual void handle_special2(u32 const op) override;
 	virtual void handle_cache(u32 const op) override;
 };
 
