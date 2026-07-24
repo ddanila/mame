@@ -2088,6 +2088,17 @@ ROM_START(datarover840j)
 	ROM_LOAD("magiccap-japan.image", 0x000000, 0x5cf318, CRC(ba5df7d1) SHA1(fbf7161681c799a33f896df4910c329ad2e0453c))
 ROM_END
 
+
+// Development build dated 1998-04-07, from the Apollo (DataRover) debugger
+// directory of the Mac Rosemary SDK. Same base address and BootCap entry as
+// the release image, but 357 KiB larger: it retains the OS test framework
+// (28 test suites, unit tests, heap inspector, input journaling) that the
+// shipping ROM omits. Useful as a source of ROM-provided self-tests.
+ROM_START(datarover840d)
+	ROM_REGION32_BE(0x800000, "maincpu", ROMREGION_ERASEFF)
+	ROM_LOAD("magiccap-usa-dev.image", 0x000000, 0x4a8ad7, CRC(98282a67) SHA1(443ab11e296c4ab5b361be4265e3fd2f72212f11))
+ROM_END
+
 } // anonymous namespace
 
 
@@ -2095,3 +2106,4 @@ ROM_END
 COMP( 1998, datarover840,  0,            0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840",               MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
 COMP( 1998, datarover840f, datarover840, 0,      datarover840f, datarover840, datarover_state, empty_init, "General Magic", "DataRover 840F (flash)",       MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
 COMP( 1998, datarover840j, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (Japan ROM)",    MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840d, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (development ROM, 1998-04-07)", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
