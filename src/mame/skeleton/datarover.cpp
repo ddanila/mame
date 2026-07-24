@@ -1207,13 +1207,22 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 
 void datarover_state::update_betty_irq()
 {
-	bool const pending =
-			bool(m_betty_pos_pending & m_betty[2])
-			|| bool(m_betty_neg_pending & m_betty[3]);
-	if (pending)
+	// Betty's IRQ output is level-like: latched edges gated by the enable
+	// registers.  Reflect an enabled pending edge into Dino's interrupt
+	// status so an edge that latched while the OS had the enables masked
+	// (it masks them around every ADC macro) is presented as soon as the
+	// mask is restored, instead of being lost.
+	bool const pos = bool(m_betty_pos_pending & m_betty[2]);
+	bool const neg = bool(m_betty_neg_pending & m_betty[3]);
+	if (pos)
+		m_dino[DINO_INTERRUPT1] |= 0x0000'0040;
+	if (neg)
+		m_dino[DINO_INTERRUPT1] |= 0x0000'0020;
+	if (pos || neg)
 		m_dino[DINO_SIB_CONTROL] |= 0x8000'0000;
 	else
 		m_dino[DINO_SIB_CONTROL] &= ~0x8000'0000;
+	update_irq();
 }
 
 
@@ -1289,29 +1298,24 @@ INPUT_CHANGED_MEMBER(datarover_state::touch_changed)
 {
 	static constexpr u16 TOUCH_MASK = 0x1000;
 
+	// Latch the edge unconditionally; the enable registers only gate the
+	// IRQ (see update_betty_irq).  Gating the latch itself dropped edges
+	// that arrived while the OS had the enables masked around an ADC
+	// macro, leaving Magic Cap waiting forever for a pen transition.
 	if (newval)
 	{
 		m_betty[0] |= TOUCH_MASK;
-		if (m_betty[2] & TOUCH_MASK)
-		{
-			m_betty_pos_pending |= TOUCH_MASK;
-			m_betty[4] |= TOUCH_MASK;
-			m_dino[DINO_INTERRUPT1] |= 0x0000'0040;
-		}
+		m_betty_pos_pending |= TOUCH_MASK;
+		m_betty[4] |= TOUCH_MASK;
 	}
 	else
 	{
 		m_betty[0] &= ~TOUCH_MASK;
-		if (m_betty[3] & TOUCH_MASK)
-		{
-			m_betty_neg_pending |= TOUCH_MASK;
-			m_betty[4] |= TOUCH_MASK;
-			m_dino[DINO_INTERRUPT1] |= 0x0000'0020;
-		}
+		m_betty_neg_pending |= TOUCH_MASK;
+		m_betty[4] |= TOUCH_MASK;
 	}
 
 	update_betty_irq();
-	update_irq();
 }
 
 
