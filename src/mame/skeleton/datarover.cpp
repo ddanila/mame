@@ -227,7 +227,11 @@ void datarover_modem_pccard_device::restore_presence()
 {
 	// Save states created without this optional card describe an empty slot.
 	// Selecting the modem device itself means it is physically inserted, so
-	// restore the card-detect pins after the rest of the machine state loads.
+	// pulse the card-detect pins after the rest of the machine state loads.
+	// The edge is also required when the state itself was saved with a modem:
+	// otherwise the restored high-level actor keeps its stale pre-save card
+	// session and does not re-enumerate the new host PTY.
+	set_present(false);
 	set_present(true);
 }
 
