@@ -647,6 +647,7 @@ public:
 		, m_boot_mode(*this, "BOOT_MODE")
 		, m_rtc_resume(*this, "RTC_RESUME")
 		, m_battery(*this, "BATTERY")
+		, m_power_supply(*this, "POWER_SUPPLY")
 		, m_option_button(*this, "OPTION_BUTTON")
 		, m_touch_x(*this, "TOUCH_X")
 		, m_touch_y(*this, "TOUCH_Y")
@@ -662,6 +663,7 @@ public:
 	INPUT_CHANGED_MEMBER(option_changed);
 	INPUT_CHANGED_MEMBER(power_changed);
 	INPUT_CHANGED_MEMBER(phone_line_changed);
+	INPUT_CHANGED_MEMBER(battery_cover_changed);
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -729,6 +731,16 @@ private:
 	static constexpr u32 DINO_TIMER_CONTROL = 0x150 / 4;
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
+
+	// PowerSupplyGen2MFS reads the external-power and battery-cover inputs
+	// from these bits: ACAdapterAttached takes powerControl bit 30, and
+	// BatteryCoverAttached takes ioControl bit 2 inverted, so the bit is set
+	// while the cover is off.  Gen2MFS.asm.h routes the cover switch to IO
+	// interrupt 2, whose edges latch in interrupt5.
+	static constexpr u32 DINO_POWER_AC_ADAPTER = 0x4000'0000; // kPowerInterruptStatusMask
+	static constexpr u32 DINO_IO_COVER_OPEN = 0x0000'0004;
+	static constexpr u32 INT5_COVER_OPEN_POS = 0x0000'0200;   // kIntIOInt2PosMask
+	static constexpr u32 INT5_COVER_OPEN_NEG = 0x0000'0004;   // kIntIOInt2NegMask
 	static constexpr u32 DINO_POWER_CONTROL = 0x1c4 / 4;
 	static constexpr u32 DINO_INTERRUPT_PENDING_MASK = 0xc000'0000;
 	static constexpr u32 DINO_INTERRUPT_LOW_PRIORITY = 0x4000'0000;
@@ -827,6 +839,7 @@ private:
 	required_ioport m_boot_mode;
 	required_ioport m_rtc_resume;
 	required_ioport m_battery;
+	required_ioport m_power_supply;
 	required_ioport m_option_button;
 	required_ioport m_touch_x;
 	required_ioport m_touch_y;
@@ -1478,6 +1491,16 @@ INPUT_CHANGED_MEMBER(datarover_state::phone_line_changed)
 }
 
 
+INPUT_CHANGED_MEMBER(datarover_state::battery_cover_changed)
+{
+	// Removing the cover is the positive edge on IO interrupt 2; refitting it
+	// is the negative one.  MainBatteryCoverPositive and its negative
+	// counterpart are the ROM's handlers.
+	m_dino[DINO_INTERRUPT5] |= newval ? INT5_COVER_OPEN_POS : INT5_COVER_OPEN_NEG;
+	update_irq();
+}
+
+
 u32 datarover_state::uart_interrupt_r() const
 {
 	u32 result = m_dino[DINO_INTERRUPT2];
@@ -1874,15 +1897,17 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 		// Holding Option during reset enters the IDT monitor; BOOT_MODE keeps
 		// that convenient configuration while OPTION_BUTTON models the live
 		// physical control used by Magic Cap.
-		return (m_dino[offset] & ~0x0000'0008)
-				| ((m_boot_mode->read() && !m_option_button->read()) ? 0x0000'0008 : 0);
+		return (m_dino[offset] & ~(0x0000'0008 | DINO_IO_COVER_OPEN))
+				| ((m_boot_mode->read() && !m_option_button->read()) ? 0x0000'0008 : 0)
+				| (BIT(m_power_supply->read(), 1) ? DINO_IO_COVER_OPEN : 0);
 
 	case DINO_POWER_CONTROL:
 		// Power-good is a read-only status input.  Without it, the low-level
 		// boot path immediately invokes CommonShutdown and restarts forever.
-		return (m_dino[offset] & ~DINO_POWER_ON_BUTTON_STATUS)
+		return (m_dino[offset] & ~(DINO_POWER_ON_BUTTON_STATUS | DINO_POWER_AC_ADAPTER))
 				| DINO_POWER_OK_STATUS
-				| (m_power_button->read() ? DINO_POWER_ON_BUTTON_STATUS : 0);
+				| (m_power_button->read() ? DINO_POWER_ON_BUTTON_STATUS : 0)
+				| (BIT(m_power_supply->read(), 0) ? DINO_POWER_AC_ADAPTER : 0);
 
 	default:
 		return m_dino[offset];
@@ -2314,6 +2339,18 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x00, "Good")
 	PORT_CONFSETTING(0x04, "Low")
 	PORT_CONFSETTING(0x08, "Empty")
+
+	// External power and the battery cover are inputs PowerSupplyGen2MFS
+	// reads.  The defaults describe a communicator running on its own cells
+	// with the cover fitted, which is what the boot path expects.
+	PORT_START("POWER_SUPPLY")
+	PORT_CONFNAME(0x01, 0x00, "AC adapter")
+	PORT_CONFSETTING(0x00, "Detached")
+	PORT_CONFSETTING(0x01, "Attached")
+	PORT_CONFNAME(0x02, 0x00, "Battery cover")
+	PORT_CONFSETTING(0x00, "Fitted")
+	PORT_CONFSETTING(0x02, "Removed")
+	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::battery_cover_changed), 0)
 
 	PORT_START("RTC_RESUME")
 	PORT_CONFNAME(0x01, 0x01, "RTC on resume")
