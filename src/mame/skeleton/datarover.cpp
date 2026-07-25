@@ -25,7 +25,7 @@
     TODO:
       - add the remaining TX39-specific CP0 and MAC behaviour
       - replace Dino register shadows with functional devices
-      - connect the built-in software modem to the SIB telecom data path
+      - make the modeled power-supply rail outputs affect their consumers
 
 ***************************************************************************/
 
@@ -38,6 +38,7 @@
 #include "dipty.h"
 #include "machine/intelfsh.h"
 #include "machine/nvram.h"
+#include "machine/pckeybrd.h"
 #include "machine/terminal.h"
 #include "sound/dmadac.h"
 
@@ -638,6 +639,7 @@ public:
 		, m_uart(*this, "uart%u", 1U)
 		, m_rs232(*this, "rs232%u", 1U)
 		, m_dmadac(*this, "speaker_dac")
+		, m_magicbus_keyboard(*this, "magicbus_keyboard")
 		, m_pccard(*this, "pccard%u", 1U)
 		, m_modem_card(*this, "pccard%u:modem", 1U)
 		, m_flash(*this, "flash%u", 0U)
@@ -654,6 +656,7 @@ public:
 		, m_touch_button(*this, "TOUCH_BUTTON")
 		, m_power_button(*this, "POWER_BUTTON")
 		, m_phone_line(*this, "PHONE_LINE")
+		, m_magicbus_accessory(*this, "MAGICBUS_ACCESSORY")
 	{
 	}
 
@@ -716,6 +719,11 @@ private:
 	static constexpr u32 INT1_SOUND_DMA_PTR_INC = 0x0004'0000; // kIntSoundDmaPtrIncMask
 	static constexpr u32 DINO_VIDEO_HIGH_BUFFER = 0x030 / 4;
 	static constexpr u32 DINO_MBUS_CONTROL1 = 0x0e0 / 4;
+	static constexpr u32 DINO_MBUS_DMA_START = 0x0e8 / 4;
+	static constexpr u32 DINO_MBUS_DMA_LENGTH = 0x0ec / 4;
+	static constexpr u32 DINO_MBUS_DMA_COUNT = 0x0f0 / 4;
+	static constexpr u32 DINO_MBUS_COMMAND = 0x0f4 / 4;
+	static constexpr u32 DINO_MBUS_DATA = 0x0f8 / 4;
 
 	// DinoModule.mbusControl1 status bits, from the SDK's Dino.asm.h.
 	static constexpr u32 DINO_MBUS_ENABLED_STATUS = 0x8000'0000; // kMbusEnabledStatusMask
@@ -727,7 +735,10 @@ private:
 	// interrupt2 Magic Bus bits, from Dino.asm.h.
 	static constexpr u32 INT2_MBUS_TRANSMIT = 0x0000'0800; // kIntMbusTransmitMask
 	static constexpr u32 INT2_MBUS_EMPTY = 0x0000'0200;    // kIntMbusEmptyMask
+	static constexpr u32 INT2_MBUS_COMMAND = 0x0000'0040;  // kIntMbusDetMask
 	static constexpr u32 INT2_MBUS_DMA_END = 0x0000'0020;  // kIntMbusDmaEndMask
+	static constexpr u32 INT2_MBUS_REQUEST_POS = 0x0000'0008; // kIntMbusIntPosMask
+	static constexpr u32 INT2_MBUS_REQUEST_NEG = 0x0000'0004; // kIntMbusIntNegMask
 	static constexpr u32 DINO_INTERRUPT1 = 0x100 / 4;
 	static constexpr u32 DINO_INTERRUPT2 = 0x104 / 4;
 	static constexpr u32 DINO_INTERRUPT3 = 0x108 / 4;
@@ -818,6 +829,10 @@ private:
 	void terminal_key(u8 data);
 	template <unsigned Channel> void uart_received(u8 data);
 	void update_irq();
+	void magicbus_set_request(bool asserted);
+	void magicbus_command(u16 command);
+	void magicbus_deliver_response();
+	void magicbus_accept_host_data();
 	void update_sib_timers();
 	bool sound_dma_running() const;
 	void advance_sound_dma();
@@ -834,6 +849,7 @@ private:
 	TIMER_CALLBACK_MEMBER(sib_tick);
 	TIMER_CALLBACK_MEMBER(telecom_tick);
 	TIMER_CALLBACK_MEMBER(sound_tick);
+	TIMER_CALLBACK_MEMBER(magicbus_keyboard_tick);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 
 	required_device<r3900_device> m_maincpu;
@@ -842,6 +858,7 @@ private:
 	required_device_array<datarover_uart_device, 2> m_uart;
 	required_device_array<rs232_port_device, 2> m_rs232;
 	required_device<dmadac_sound_device> m_dmadac;
+	required_device<at_keyboard_device> m_magicbus_keyboard;
 	required_device_array<pccard_slot_device, 2> m_pccard;
 	optional_device_array<datarover_modem_pccard_device, 2> m_modem_card;
 	optional_device_array<fujitsu_29f016a_device, 4> m_flash;
@@ -858,6 +875,7 @@ private:
 	required_ioport m_touch_button;
 	required_ioport m_power_button;
 	required_ioport m_phone_line;
+	required_ioport m_magicbus_accessory;
 
 	std::array<u32, 0x200 / 4> m_dino{};
 	std::array<u32, 0x24 / 4> m_glacier1{};
@@ -884,8 +902,26 @@ private:
 	bool m_sound_dma_half_signalled = false;
 	bool m_telecom_dma_half_signalled = false;
 	u32 m_telecom_loopback = 0;
+	bool m_magicbus_request = false;
+	bool m_magicbus_assigned = false;
+	u8 m_magicbus_info_page = 0;
+	enum : u8
+	{
+		MBUS_RESPONSE_NONE,
+		MBUS_RESPONSE_ID,
+		MBUS_RESPONSE_INFO,
+		MBUS_RESPONSE_REQUEST,
+		MBUS_RESPONSE_KEYBOARD
+	};
+	u8 m_magicbus_response = MBUS_RESPONSE_NONE;
+	bool m_magicbus_keyboard_read_pending = false;
+	bool m_magicbus_host_data_pending = false;
+	std::array<u8, 256> m_magicbus_key_data{};
+	u16 m_magicbus_key_head = 0;
+	u16 m_magicbus_key_count = 0;
 	emu_timer *m_telecom_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
+	emu_timer *m_magicbus_keyboard_timer = nullptr;
 };
 
 
@@ -1880,6 +1916,278 @@ TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 }
 
 
+void datarover_state::magicbus_set_request(bool asserted)
+{
+	if (m_magicbus_request == asserted)
+		return;
+
+	m_magicbus_request = asserted;
+	m_dino[DINO_INTERRUPT2] |= asserted
+			? INT2_MBUS_REQUEST_POS
+			: INT2_MBUS_REQUEST_NEG;
+	update_irq();
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::magicbus_keyboard_tick)
+{
+	for (unsigned drained = 0; drained < m_magicbus_key_data.size(); ++drained)
+	{
+		u8 const data = m_magicbus_keyboard->read();
+		if (!data)
+			break;
+
+		// The generic AT keyboard powers up with the 0xaa self-test byte, and
+		// commands sent by the Magic Bus keyboard client produce 0xfa
+		// acknowledgements.  Those are controller protocol bytes, not Set-2
+		// key transitions, and the Magic Cap client only accepts the latter.
+		if (data == 0xaa || data == 0xfa)
+			continue;
+
+		if (m_magicbus_key_count < m_magicbus_key_data.size())
+		{
+			m_magicbus_key_data[
+					(m_magicbus_key_head + m_magicbus_key_count)
+							% m_magicbus_key_data.size()] = data;
+			++m_magicbus_key_count;
+		}
+	}
+
+	if (m_magicbus_key_count && m_magicbus_assigned
+			&& BIT(m_magicbus_accessory->read(), 0))
+		magicbus_set_request(true);
+}
+
+
+void datarover_state::magicbus_command(u16 command)
+{
+	// Wire command words are the SDK's command-table entry XORed with the
+	// peripheral address code.  This model presents one AT keyboard at
+	// address zero; address seven is the broadcast address.
+	switch (command)
+	{
+	case 0xdef0: // command 31, broadcast: assign an address
+		if (BIT(m_magicbus_accessory->read(), 0) && !m_magicbus_assigned)
+			magicbus_set_request(true);
+		break;
+
+	case 0xdca8: // command 24, address 0: take the proposed address
+		if (BIT(m_magicbus_accessory->read(), 0) && m_magicbus_request)
+		{
+			m_magicbus_assigned = true;
+			magicbus_set_request(false);
+		}
+		break;
+
+	case 0xcc5c: // command 12: select the fixed identification record
+		if (m_magicbus_assigned)
+			m_magicbus_info_page = 1;
+		break;
+
+	case 0xcc60: // command 13: select the full peripheral-information record
+		if (m_magicbus_assigned)
+			m_magicbus_info_page = 2;
+		break;
+
+	case 0xcc18: // command 1: read the peripheral request record
+		if (m_magicbus_assigned && m_magicbus_request)
+		{
+			m_magicbus_response = MBUS_RESPONSE_REQUEST;
+			m_magicbus_keyboard_read_pending = true;
+		}
+		break;
+
+	case 0xcc24: // command 2: read the selected data
+		if (m_magicbus_assigned)
+		{
+			if (m_magicbus_keyboard_read_pending)
+				m_magicbus_response = MBUS_RESPONSE_KEYBOARD;
+			else if (m_magicbus_info_page == 1)
+				m_magicbus_response = MBUS_RESPONSE_ID;
+			else if (m_magicbus_info_page == 2)
+				m_magicbus_response = MBUS_RESPONSE_INFO;
+		}
+		break;
+
+	case 0xcc3c: // command 5: write an AT-keyboard control packet
+		if (m_magicbus_assigned)
+			m_magicbus_host_data_pending = true;
+		break;
+
+	case 0xdcc8: // command 28, address 0: poll/acknowledge the request line
+	case 0xdecc: // command 28, broadcast
+		// These delimit the ROM's poll transaction.  The line is cleared
+		// when its request record is read and must stay clear while that
+		// record waits in the client's software queue.
+		break;
+
+	default:
+		break;
+	}
+}
+
+
+void datarover_state::magicbus_deliver_response()
+{
+	std::array<u8, 88> response{};
+	unsigned response_size = 0;
+
+	switch (m_magicbus_response)
+	{
+	case MBUS_RESPONSE_ID:
+		response[0] = 'A';
+		response[1] = 'T';
+		response[2] = 'K';
+		response[3] = 'B';
+		response_size = 4;
+		break;
+
+	case MBUS_RESPONSE_INFO:
+	{
+		auto const put_be16 = [&response](unsigned offset, u16 value)
+		{
+			response[offset] = value >> 8;
+			response[offset + 1] = value;
+		};
+		auto const put_be32 = [&response](unsigned offset, u32 value)
+		{
+			response[offset] = value >> 24;
+			response[offset + 1] = value >> 16;
+			response[offset + 2] = value >> 8;
+			response[offset + 3] = value;
+		};
+
+		// MagicbusPeripheralInfo, reconstructed from the SDK ELF's retained
+		// type information.  The three variable strings are empty; the ROM
+		// selects its built-in AT-keyboard client from the peripheral ID.
+		put_be16(0, 0);
+		put_be16(2, 84);
+		put_be32(4, 0x4154'4b42); // "ATKB"
+		response[8] = 1;          // hardware version
+		response[9] = 1;          // software version
+		response[10] = 1;         // protocol version
+		put_be32(12, 115'200);    // command frequency
+		put_be32(16, 10);         // command delay
+		put_be32(20, 115'200);    // data-in frequency
+		put_be32(24, 10);         // data-in delay
+		put_be32(28, 115'200);    // data-out frequency
+		put_be32(32, 10);         // data-out delay
+		put_be32(36, 10'000);     // request latency
+		put_be32(40, 100'000);    // transaction time
+		put_be32(44, 10'000);     // active request interval
+		put_be32(48, 1'000);      // inactive request interval
+		response[64] = 16;        // maximum request record
+
+		u16 checksum = 1;
+		for (unsigned offset = 0; offset < 86; ++offset)
+			checksum += response[offset];
+		put_be16(86, checksum);
+		response_size = response.size();
+		break;
+	}
+
+	case MBUS_RESPONSE_REQUEST:
+		// The client dispatches request kind 14 to
+		// MagicBusATKeyboard_PeripheralRequest.  Request records are always
+		// copied into the ROM's 16-byte queue entry.
+		response[1] = 14;
+		response_size = 16;
+		magicbus_set_request(false);
+		break;
+
+	case MBUS_RESPONSE_KEYBOARD:
+	{
+		unsigned const count = std::min<unsigned>(m_magicbus_key_count, 15);
+		response[0] = count;
+		for (unsigned index = 0; index < count; ++index)
+		{
+			response[index + 1] = m_magicbus_key_data[m_magicbus_key_head];
+			m_magicbus_key_head =
+					(m_magicbus_key_head + 1) % m_magicbus_key_data.size();
+		}
+		m_magicbus_key_count -= count;
+		response_size = 16;
+		m_magicbus_keyboard_read_pending = false;
+		magicbus_set_request(m_magicbus_key_count != 0);
+		break;
+	}
+
+	default:
+		return;
+	}
+
+	m_magicbus_response = MBUS_RESPONSE_NONE;
+
+	if (BIT(m_dino[DINO_MBUS_CONTROL1], 16))
+	{
+		address_space &space = m_maincpu->space(AS_PROGRAM);
+		u32 const start = m_dino[DINO_MBUS_DMA_START] & 0x1fff'fffc;
+		unsigned const requested =
+				(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
+		unsigned const count = std::min(response_size, requested);
+		for (unsigned offset = 0; offset < count; ++offset)
+			space.write_byte(start + offset, response[offset]);
+
+		m_dino[DINO_MBUS_DMA_COUNT] = count >= 4 ? count - 4 : 0;
+		m_dino[DINO_INTERRUPT2] |= INT2_MBUS_COMMAND | INT2_MBUS_DMA_END;
+	}
+	else
+	{
+		m_dino[DINO_MBUS_DATA] =
+				(u32(response[0]) << 24)
+				| (u32(response[1]) << 16)
+				| (u32(response[2]) << 8)
+				| response[3];
+		m_dino[DINO_INTERRUPT2] |= INT2_MBUS_COMMAND;
+	}
+}
+
+
+void datarover_state::magicbus_accept_host_data()
+{
+	if (!m_magicbus_host_data_pending
+			|| !BIT(m_dino[DINO_MBUS_CONTROL1], 15))
+		return;
+
+	// The ROM's AT-keyboard client wraps controller commands in an eight-byte
+	// Magic Bus packet beginning with "K".  MAME already generates Set-2
+	// scancodes, so only state-changing commands need forwarding.  Drain the
+	// AT controller's acknowledgements through magicbus_keyboard_tick rather
+	// than exposing them as keystrokes.
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+	u32 const start = m_dino[DINO_MBUS_DMA_START] & 0x1fff'fffc;
+	unsigned const count =
+			(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
+	if (count >= 3 && space.read_byte(start) == 'K')
+	{
+		switch (space.read_byte(start + 1))
+		{
+		case 1: // reset
+			m_magicbus_key_head = 0;
+			m_magicbus_key_count = 0;
+			m_magicbus_keyboard->write(0xff);
+			break;
+
+		case 2: // LED state
+			m_magicbus_keyboard->write(0xed);
+			m_magicbus_keyboard->write(space.read_byte(start + 3) & 7);
+			break;
+
+		case 3: // typematic rate, followed by enable
+			m_magicbus_keyboard->write(0xf3);
+			m_magicbus_keyboard->write(space.read_byte(start + 3));
+			if (count >= 5 && space.read_byte(start + 4) == 0xf4)
+				m_magicbus_keyboard->write(0xf4);
+			break;
+		}
+	}
+
+	m_magicbus_host_data_pending = false;
+	m_dino[DINO_MBUS_DMA_COUNT] = count >= 4 ? count - 4 : 0;
+	m_dino[DINO_INTERRUPT2] |= INT2_MBUS_DMA_END;
+}
+
+
 u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 {
 	(void)mem_mask;
@@ -1913,14 +2221,13 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 	case DINO_MBUS_CONTROL1:
 		// kMbusEnabledStatusMask follows the module enable, the transmit FIFO
 		// is always empty because commands complete synchronously, and
-		// kMbusIntStatusMask is the Magic Bus request line.  Nothing is
-		// attached, so the line never asserts: TestMBReqLine reads that bit
-		// and GetPollingCommand only fetches a peripheral poll when it is
-		// set, so leaving it clear stops the OS probing a bus with no devices
-		// and then counting the silence as failures.
+		// kMbusIntStatusMask is the selected peripheral's request line.
+		// TestMBReqLine samples this bit before GetPollingCommand fetches a
+		// request record from the attached AT keyboard.
 		return (m_dino[offset] & ~DINO_MBUS_STATUS)
 				| (BIT(m_dino[offset], 0) ? DINO_MBUS_ENABLED_STATUS : 0)
-				| DINO_MBUS_EMPTY_STATUS;
+				| DINO_MBUS_EMPTY_STATUS
+				| (m_magicbus_request ? DINO_MBUS_INT_STATUS : 0);
 
 	case DINO_IO_CONTROL:
 		// Input bits are sampled independently of the writable GPIO fields.
@@ -2031,19 +2338,40 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		COMBINE_DATA(&m_dino[offset]);
 		m_dino[offset] &= ~DINO_MBUS_STATUS;
 
-		// Magic Bus transfers are synchronous here: the byte is shifted out
-		// the instant the module is enabled.  The monitor polls the transmit
-		// bit, but the OS also waits for the shifter to drain before it
-		// considers a command finished.  Reporting only "transmit buffer
-		// available" left MagicBus_AssignMagicBusAddress waiting, and the
-		// address assignment it broadcasts every half minute was recorded as
-		// a peripheral failure until the count reached the ROM's limit and it
-		// warned about an attached device that was never there.
+		// Transfers are synchronous, but staging is observable: the monitor
+		// waits for the transmit buffer before writing a command, while the OS
+		// waits for empty after that command has entered the shifter.
 		if (BIT(m_dino[offset], 0))
 		{
+			// The IDT monitor waits for "transmit buffer available" before it
+			// writes mbusCommand.  Empty belongs to the subsequent command
+			// completion, so do not raise it at this staging point.
+			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT;
+			if (m_magicbus_response != MBUS_RESPONSE_NONE)
+				magicbus_deliver_response();
+			magicbus_accept_host_data();
+		}
+		break;
+
+	case DINO_MBUS_COMMAND:
+		COMBINE_DATA(&m_dino[offset]);
+		if (ACCESSING_BITS_0_15)
+		{
+			u16 const command = m_dino[offset];
 			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT | INT2_MBUS_EMPTY;
-			if (BIT(m_dino[offset], 15))
-				m_dino[DINO_INTERRUPT2] |= INT2_MBUS_DMA_END;
+			magicbus_command(command);
+		}
+		break;
+
+	case DINO_MBUS_DATA:
+		COMBINE_DATA(&m_dino[offset]);
+		if (m_magicbus_host_data_pending)
+		{
+			// Type-2 writes of four bytes or fewer use the hold register
+			// rather than DMA.  No current ATKB control packet is that short,
+			// but completing it here preserves the controller semantics.
+			m_magicbus_host_data_pending = false;
+			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_EMPTY;
 		}
 		break;
 
@@ -2234,6 +2562,8 @@ void datarover_state::machine_start()
 	m_sib_timer = timer_alloc(FUNC(datarover_state::sib_tick), this);
 	m_sound_timer = timer_alloc(FUNC(datarover_state::sound_tick), this);
 	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
+	m_magicbus_keyboard_timer =
+			timer_alloc(FUNC(datarover_state::magicbus_keyboard_tick), this);
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
@@ -2257,6 +2587,15 @@ void datarover_state::machine_start()
 	save_item(NAME(m_sound_dma_half_signalled));
 	save_item(NAME(m_telecom_dma_half_signalled));
 	save_item(NAME(m_telecom_loopback));
+	save_item(NAME(m_magicbus_request));
+	save_item(NAME(m_magicbus_assigned));
+	save_item(NAME(m_magicbus_info_page));
+	save_item(NAME(m_magicbus_response));
+	save_item(NAME(m_magicbus_keyboard_read_pending));
+	save_item(NAME(m_magicbus_host_data_pending));
+	save_item(NAME(m_magicbus_key_data));
+	save_item(NAME(m_magicbus_key_head));
+	save_item(NAME(m_magicbus_key_count));
 	machine().save().register_postload(
 			save_prepost_delegate(FUNC(datarover_state::restore_inputs), this));
 }
@@ -2299,6 +2638,16 @@ void datarover_state::machine_reset()
 	m_telecom_timer->reset();
 	m_telecom_dma_half_signalled = false;
 	m_telecom_loopback = 0;
+	m_magicbus_request = false;
+	m_magicbus_assigned = false;
+	m_magicbus_info_page = 0;
+	m_magicbus_response = MBUS_RESPONSE_NONE;
+	m_magicbus_keyboard_read_pending = false;
+	m_magicbus_host_data_pending = false;
+	m_magicbus_key_head = 0;
+	m_magicbus_key_count = 0;
+	m_magicbus_keyboard_timer->adjust(
+			attotime::from_msec(1), 0, attotime::from_hz(240));
 	m_dmadac->enable(0);
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
@@ -2401,6 +2750,11 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFNAME(0x01, 0x01, "RTC on resume")
 	PORT_CONFSETTING(0x01, "Advance by host clock")
 	PORT_CONFSETTING(0x00, "Freeze at saved value")
+
+	PORT_START("MAGICBUS_ACCESSORY")
+	PORT_CONFNAME(0x01, 0x01, "Magic Bus accessory")
+	PORT_CONFSETTING(0x01, "AT keyboard")
+	PORT_CONFSETTING(0x00, "None")
 INPUT_PORTS_END
 
 
@@ -2457,6 +2811,8 @@ void datarover_state::datarover840(machine_config &config)
 
 	GENERIC_TERMINAL(config, m_terminal);
 	m_terminal->set_keyboard_callback(FUNC(datarover_state::terminal_key));
+
+	AT_KEYB(config, m_magicbus_keyboard, pc_keyboard_device::KEYBOARD_TYPE::AT, 2);
 
 	for (unsigned channel = 0; channel < 2; ++channel)
 	{
