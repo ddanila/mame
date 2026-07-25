@@ -645,6 +645,7 @@ public:
 		, m_ram(*this, "ram")
 		, m_rom(*this, "maincpu")
 		, m_boot_mode(*this, "BOOT_MODE")
+		, m_rtc_resume(*this, "RTC_RESUME")
 		, m_option_button(*this, "OPTION_BUTTON")
 		, m_touch_x(*this, "TOUCH_X")
 		, m_touch_y(*this, "TOUCH_Y")
@@ -772,6 +773,7 @@ private:
 	required_shared_ptr<u32> m_ram;
 	required_region_ptr<u32> m_rom;
 	required_ioport m_boot_mode;
+	required_ioport m_rtc_resume;
 	required_ioport m_option_button;
 	required_ioport m_touch_x;
 	required_ioport m_touch_y;
@@ -1926,9 +1928,13 @@ void datarover_state::machine_reset()
 				(u64(m_rtc_nvram_data[1]) << 32) | m_rtc_nvram_data[2];
 		u64 const saved_host_time =
 				(u64(m_rtc_nvram_data[3]) << 32) | m_rtc_nvram_data[4];
-		system_time now;
-		machine().current_datetime(now);
-		s64 const elapsed = now.time - s64(saved_host_time);
+		s64 elapsed = 0;
+		if (BIT(m_rtc_resume->read(), 0))
+		{
+			system_time now;
+			machine().current_datetime(now);
+			elapsed = now.time - s64(saved_host_time);
+		}
 		m_rtc_base = (saved_ticks + (u64(std::max<s64>(elapsed, 0)) * 32'768)) & RTC_MASK;
 	}
 	m_rtc_origin = machine().time().as_ticks(32'768);
@@ -1976,6 +1982,16 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x01, "Connected")
 	PORT_CONFSETTING(0x00, "Disconnected")
 	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::phone_line_changed), 0)
+
+	// Resuming battery-backed state normally advances the RTC by the host
+	// wall-clock time that passed while the machine was off, which is what a
+	// real communicator does.  That makes every run of a headless regression
+	// see a different time of day, so automated checks can pin the clock to the
+	// value stored in NVRAM instead and get reproducible behavior.
+	PORT_START("RTC_RESUME")
+	PORT_CONFNAME(0x01, 0x01, "RTC on resume")
+	PORT_CONFSETTING(0x01, "Advance by host clock")
+	PORT_CONFSETTING(0x00, "Freeze at saved value")
 INPUT_PORTS_END
 
 
