@@ -25,7 +25,7 @@
     TODO:
       - add the remaining TX39-specific CP0 and MAC behaviour
       - replace Dino register shadows with functional devices
-      - connect the built-in software modem and complete buffered SIB sound DMA
+      - connect the built-in software modem to the SIB telecom data path
 
 ***************************************************************************/
 
@@ -689,6 +689,24 @@ private:
 	static constexpr unsigned SIB_SOUND_PTR_SHIFT = 18;    // kSibSoundDmaPtrShift
 
 	// DinoModule.sibSize sound field, and interrupt1 status bits.
+	static constexpr u32 DINO_SIB_TEL_RX_START = 0x06c / 4;
+	static constexpr u32 DINO_SIB_TEL_TX_START = 0x070 / 4;
+	static constexpr u32 DINO_SIB_TEL_HOLD = 0x07c / 4;
+
+	// Telecom occupies the low half of sibDMA and sibSize.
+	static constexpr u32 SIB_TEL_DMA_ONCE = 0x0000'8000;   // kSibTelDmaOnceMask
+	static constexpr u32 SIB_TEL_DMA_LOOP = 0x0000'4000;   // kSibTelDmaLoopMask
+	static constexpr u32 SIB_TEL_DMA_PTR = 0x0000'3ffc;    // kSibTelDmaPtrMask
+	static constexpr u32 SIB_TEL_RX_DMA_EN = 0x0000'0002;  // kSibEnTelRxDmaMask
+	static constexpr u32 SIB_TEL_TX_DMA_EN = 0x0000'0001;  // kSibEnTelTxDmaMask
+	static constexpr unsigned SIB_TEL_PTR_SHIFT = 2;       // kSibTelDmaPtrShift
+	static constexpr u32 SIB_TEL_SIZE = 0x0000'3ffc;       // kSibTelSizeMask
+
+	static constexpr u32 INT1_TEL_DMA_HALF = 0x0010'0000;  // kIntTelDmaHalfMask
+	static constexpr u32 INT1_TEL_DMA_END = 0x0008'0000;   // kIntTelDmaEndMask
+	static constexpr u32 INT1_TEL_DMA_PTR_INC = 0x0002'0000; // kIntTelDmaPtrIncMask
+	static constexpr u32 INT1_TEL_RECEIVE = 0x0000'0200;   // kIntTeleReceiveMask
+
 	static constexpr u32 SIB_SOUND_SIZE = 0x3ffc'0000;     // kSibSoundSizeMask
 	static constexpr u32 INT1_SOUND_DMA_HALF = 0x0040'0000; // kIntSoundDmaHalfMask
 	static constexpr u32 INT1_SOUND_DMA_END = 0x0020'0000;  // kIntSoundDmaEndMask
@@ -776,6 +794,8 @@ private:
 	void update_sib_timers();
 	bool sound_dma_running() const;
 	void advance_sound_dma();
+	bool telecom_dma_running() const;
+	void advance_telecom_dma();
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -785,6 +805,7 @@ private:
 	TIMER_CALLBACK_MEMBER(rtc_rollover);
 	TIMER_CALLBACK_MEMBER(rtc_persist_tick);
 	TIMER_CALLBACK_MEMBER(sib_tick);
+	TIMER_CALLBACK_MEMBER(telecom_tick);
 	TIMER_CALLBACK_MEMBER(sound_tick);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 
@@ -832,6 +853,9 @@ private:
 	emu_timer *m_rtc_persist_timer = nullptr;
 	emu_timer *m_sib_timer = nullptr;
 	bool m_sound_dma_half_signalled = false;
+	bool m_telecom_dma_half_signalled = false;
+	u32 m_telecom_loopback = 0;
+	emu_timer *m_telecom_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
 };
 
@@ -1384,6 +1408,9 @@ INPUT_CHANGED_MEMBER(datarover_state::power_changed)
 				m_dino[DINO_SIB_SF1_STATUS] = 0;
 				m_dino[DINO_INTERRUPT1] &= ~0x0000'05e0;
 				m_sib_timer->reset();
+				m_telecom_timer->reset();
+				m_telecom_dma_half_signalled = false;
+				m_telecom_loopback = 0;
 				m_sound_timer->reset();
 			}
 			m_dino[DINO_POWER_CONTROL] |= DINO_POWER_VCC_ON;
@@ -1520,6 +1547,64 @@ void datarover_state::advance_sound_dma()
 }
 
 
+bool datarover_state::telecom_dma_running() const
+{
+	// kSibEnableTel gates the channel; either direction's DMA enable starts
+	// the transfer, and the two share one pointer in sibDMA.
+	return BIT(m_dino[DINO_SIB_CONTROL], 0)
+			&& BIT(m_dino[DINO_SIB_CONTROL], 5)
+			&& (m_dino[DINO_SIB_DMA] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN));
+}
+
+
+void datarover_state::advance_telecom_dma()
+{
+	u32 const words = ((m_dino[DINO_SIB_SIZE] & SIB_TEL_SIZE) >> SIB_TEL_PTR_SHIFT) + 1;
+	u32 ptr = (m_dino[DINO_SIB_DMA] & SIB_TEL_DMA_PTR) >> SIB_TEL_PTR_SHIFT;
+	address_space &space = m_maincpu->space(AS_PROGRAM);
+
+	// Transmit first: the DAA and phone line are not modelled, so the samples
+	// the software modem produces are consumed at the programmed rate.  With
+	// kSibLoopModeMask set the SIB feeds them straight back, which is what the
+	// modem's own loopback diagnostics expect.
+	if (m_dino[DINO_SIB_DMA] & SIB_TEL_TX_DMA_EN)
+	{
+		u32 const base = m_dino[DINO_SIB_TEL_TX_START] & 0x1fff'fffc;
+		m_telecom_loopback = space.read_dword(base + ptr * 4);
+	}
+
+	if (m_dino[DINO_SIB_DMA] & SIB_TEL_RX_DMA_EN)
+	{
+		u32 const base = m_dino[DINO_SIB_TEL_RX_START] & 0x1fff'fffc;
+		bool const loopback = BIT(m_dino[DINO_SIB_CONTROL], 3);
+		space.write_dword(base + ptr * 4, loopback ? m_telecom_loopback : 0);
+	}
+
+	++ptr;
+	m_dino[DINO_INTERRUPT1] |= INT1_TEL_DMA_PTR_INC;
+
+	if (!m_telecom_dma_half_signalled && ptr >= words / 2)
+	{
+		m_telecom_dma_half_signalled = true;
+		m_dino[DINO_INTERRUPT1] |= INT1_TEL_DMA_HALF;
+	}
+
+	if (ptr >= words)
+	{
+		m_dino[DINO_INTERRUPT1] |= INT1_TEL_DMA_END;
+		m_telecom_dma_half_signalled = false;
+		ptr = 0;
+		if (!(m_dino[DINO_SIB_DMA] & SIB_TEL_DMA_LOOP))
+			m_dino[DINO_SIB_DMA] &= ~(SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN);
+	}
+
+	m_dino[DINO_SIB_DMA] = (m_dino[DINO_SIB_DMA] & ~SIB_TEL_DMA_PTR)
+			| ((ptr << SIB_TEL_PTR_SHIFT) & SIB_TEL_DMA_PTR);
+
+	update_irq();
+}
+
+
 void datarover_state::update_sib_timers()
 {
 	bool const sib_enabled = BIT(m_dino[DINO_SIB_CONTROL], 0);
@@ -1543,6 +1628,36 @@ void datarover_state::update_sib_timers()
 	{
 		m_sound_timer->reset();
 	}
+
+	// The telecom channel is clocked independently of sound, by kSibTelDivMask.
+	if (sib_enabled && BIT(m_dino[DINO_SIB_CONTROL], 5))
+	{
+		unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
+		double const sample_rate = 9'216'000.0 / (32.0 * divisor);
+		attotime const interval = attotime::from_hz(sample_rate / 2.0);
+		m_telecom_timer->adjust(interval, 0, interval);
+	}
+	else
+	{
+		m_telecom_timer->reset();
+	}
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::telecom_tick)
+{
+	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 5))
+		return;
+
+	if (m_dino[DINO_SIB_DMA] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN))
+	{
+		advance_telecom_dma();
+		return;
+	}
+
+	// Unbuffered telecom: one hold-register slot is free.
+	m_dino[DINO_INTERRUPT1] |= INT1_TEL_RECEIVE;
+	update_irq();
 }
 
 
@@ -1785,10 +1900,13 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 		// The pointer field is written back by hardware, so a write keeps the
 		// current position rather than taking one from the CPU.
-		u32 const preserved = m_dino[offset] & SIB_SOUND_DMA_PTR;
+		u32 const preserved = m_dino[offset] & (SIB_SOUND_DMA_PTR | SIB_TEL_DMA_PTR);
 		bool const was_running = bool(m_dino[offset] & SIB_SOUND_TX_DMA_EN);
+		bool const was_tel_running =
+				bool(m_dino[offset] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN));
 		COMBINE_DATA(&m_dino[offset]);
-		m_dino[offset] = (m_dino[offset] & ~SIB_SOUND_DMA_PTR) | preserved;
+		m_dino[offset] = (m_dino[offset] & ~(SIB_SOUND_DMA_PTR | SIB_TEL_DMA_PTR))
+				| preserved;
 
 		if (!was_running && (m_dino[offset] & SIB_SOUND_TX_DMA_EN))
 		{
@@ -1796,6 +1914,14 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 			m_dino[offset] &= ~SIB_SOUND_DMA_PTR;
 			m_sound_dma_half_signalled = false;
 			m_dmadac->flush();
+		}
+
+		if (!was_tel_running
+				&& (m_dino[offset] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN)))
+		{
+			m_dino[offset] &= ~SIB_TEL_DMA_PTR;
+			m_telecom_dma_half_signalled = false;
+			m_telecom_loopback = 0;
 		}
 		break;
 	}
@@ -1995,6 +2121,7 @@ void datarover_state::machine_start()
 	m_rtc_persist_timer = timer_alloc(FUNC(datarover_state::rtc_persist_tick), this);
 	m_sib_timer = timer_alloc(FUNC(datarover_state::sib_tick), this);
 	m_sound_timer = timer_alloc(FUNC(datarover_state::sound_tick), this);
+	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
@@ -2015,6 +2142,9 @@ void datarover_state::machine_start()
 	save_item(NAME(m_rtc_nvram_data));
 	save_item(NAME(m_rtc_base));
 	save_item(NAME(m_rtc_origin));
+	save_item(NAME(m_sound_dma_half_signalled));
+	save_item(NAME(m_telecom_dma_half_signalled));
+	save_item(NAME(m_telecom_loopback));
 	machine().save().register_postload(
 			save_prepost_delegate(FUNC(datarover_state::restore_inputs), this));
 }
