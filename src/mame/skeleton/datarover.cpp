@@ -677,6 +677,22 @@ private:
 	static constexpr u32 DINO_SIB_SF1_STATUS = 0x08c / 4;
 	static constexpr u32 DINO_SIB_SOUND_HOLD = 0x078 / 4;
 	static constexpr u32 DINO_SIB_CONTROL = 0x074 / 4;
+	static constexpr u32 DINO_SIB_SIZE = 0x060 / 4;
+	static constexpr u32 DINO_SIB_SOUND_TX_START = 0x068 / 4;
+	static constexpr u32 DINO_SIB_DMA = 0x090 / 4;
+
+	// DinoModule.sibDMA, named by the SDK's Dino.asm.h.
+	static constexpr u32 SIB_SOUND_DMA_ONCE = 0x8000'0000; // kSibSoundDmaOnceMask
+	static constexpr u32 SIB_SOUND_DMA_LOOP = 0x4000'0000; // kSibSoundDmaLoopMask
+	static constexpr u32 SIB_SOUND_DMA_PTR = 0x3ffc'0000;  // kSibSoundDmaPtrMask
+	static constexpr u32 SIB_SOUND_TX_DMA_EN = 0x0001'0000; // kSibEnSoundTxDmaMask
+	static constexpr unsigned SIB_SOUND_PTR_SHIFT = 18;    // kSibSoundDmaPtrShift
+
+	// DinoModule.sibSize sound field, and interrupt1 status bits.
+	static constexpr u32 SIB_SOUND_SIZE = 0x3ffc'0000;     // kSibSoundSizeMask
+	static constexpr u32 INT1_SOUND_DMA_HALF = 0x0040'0000; // kIntSoundDmaHalfMask
+	static constexpr u32 INT1_SOUND_DMA_END = 0x0020'0000;  // kIntSoundDmaEndMask
+	static constexpr u32 INT1_SOUND_DMA_PTR_INC = 0x0004'0000; // kIntSoundDmaPtrIncMask
 	static constexpr u32 DINO_VIDEO_HIGH_BUFFER = 0x030 / 4;
 	static constexpr u32 DINO_MBUS_CONTROL1 = 0x0e0 / 4;
 	static constexpr u32 DINO_INTERRUPT1 = 0x100 / 4;
@@ -758,6 +774,8 @@ private:
 	template <unsigned Channel> void uart_received(u8 data);
 	void update_irq();
 	void update_sib_timers();
+	bool sound_dma_running() const;
+	void advance_sound_dma();
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -813,6 +831,7 @@ private:
 	emu_timer *m_rtc_rollover_timer = nullptr;
 	emu_timer *m_rtc_persist_timer = nullptr;
 	emu_timer *m_sib_timer = nullptr;
+	bool m_sound_dma_half_signalled = false;
 	emu_timer *m_sound_timer = nullptr;
 };
 
@@ -1440,6 +1459,67 @@ void datarover_state::update_irq()
 }
 
 
+bool datarover_state::sound_dma_running() const
+{
+	// Sound DMA needs the SIB enabled, its sound channel enabled, and the
+	// transmit DMA enable the ROM sets last (SibCmdStartSoundOut ends with
+	// sibDMA |= kSibEnSoundTxDmaMask).
+	return BIT(m_dino[DINO_SIB_CONTROL], 0)
+			&& BIT(m_dino[DINO_SIB_CONTROL], 4)
+			&& (m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN);
+}
+
+
+void datarover_state::advance_sound_dma()
+{
+	// The sound size and DMA pointer fields both count 32-bit words, and the
+	// ROM programs the size as the last valid index rather than a count.
+	u32 const words = ((m_dino[DINO_SIB_SIZE] & SIB_SOUND_SIZE) >> SIB_SOUND_PTR_SHIFT) + 1;
+	u32 ptr = (m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_PTR) >> SIB_SOUND_PTR_SHIFT;
+
+	// The ROM hands Dino a start address with the segment bits still set, so
+	// mask it to a physical DRAM address the way the SIB's bus master would.
+	u32 const base = m_dino[DINO_SIB_SOUND_TX_START] & 0x1fff'fffc;
+	u32 const word = m_maincpu->space(AS_PROGRAM).read_dword(base + ptr * 4);
+
+	if (BIT(m_betty[8], 15))
+	{
+		// One 32-bit slot carries two signed 16-bit samples, most significant
+		// first, matching the unbuffered hold register.
+		std::array<s16, 2> samples{ s16(word >> 16), s16(word) };
+		m_dmadac->transfer(0, 1, 1, samples.size(), samples.data());
+	}
+
+	++ptr;
+	m_dino[DINO_INTERRUPT1] |= INT1_SOUND_DMA_PTR_INC;
+
+	if (!m_sound_dma_half_signalled && ptr >= words / 2)
+	{
+		m_sound_dma_half_signalled = true;
+		m_dino[DINO_INTERRUPT1] |= INT1_SOUND_DMA_HALF;
+	}
+
+	if (ptr >= words)
+	{
+		m_dino[DINO_INTERRUPT1] |= INT1_SOUND_DMA_END;
+		m_sound_dma_half_signalled = false;
+		ptr = 0;
+
+		// Looping playback restarts on its own; a one-shot buffer stops and
+		// leaves the OS to queue the next one.
+		if (!(m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_LOOP))
+			m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_TX_DMA_EN;
+	}
+
+	// The pointer field is hardware-owned; SibServerSyncSoundOutDma reads it
+	// back to find how far playback has progressed.
+	m_dino[DINO_SIB_DMA] = (m_dino[DINO_SIB_DMA] & ~SIB_SOUND_DMA_PTR)
+			| ((ptr << SIB_SOUND_PTR_SHIFT) & SIB_SOUND_DMA_PTR);
+
+	update_irq();
+}
+
+
 void datarover_state::update_sib_timers()
 {
 	bool const sib_enabled = BIT(m_dino[DINO_SIB_CONTROL], 0);
@@ -1582,12 +1662,20 @@ TIMER_CALLBACK_MEMBER(datarover_state::sib_tick)
 
 TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 {
-	if (BIT(m_dino[DINO_SIB_CONTROL], 0) && BIT(m_dino[DINO_SIB_CONTROL], 4))
+	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 4))
+		return;
+
+	// Buffered playback owns the sample clock while transmit DMA is enabled;
+	// the hold register is only serviced when the OS feeds samples by hand.
+	if (m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN)
 	{
-		// One 32-bit sound-hold slot (two 16-bit samples) is available.
-		m_dino[DINO_INTERRUPT1] |= 0x0000'0400;
-		update_irq();
+		advance_sound_dma();
+		return;
 	}
+
+	// One 32-bit sound-hold slot (two 16-bit samples) is available.
+	m_dino[DINO_INTERRUPT1] |= 0x0000'0400;
+	update_irq();
 }
 
 
@@ -1692,6 +1780,25 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 			m_dmadac->transfer(0, 1, 1, samples.size(), samples.data());
 		}
 		break;
+
+	case DINO_SIB_DMA:
+	{
+		// The pointer field is written back by hardware, so a write keeps the
+		// current position rather than taking one from the CPU.
+		u32 const preserved = m_dino[offset] & SIB_SOUND_DMA_PTR;
+		bool const was_running = bool(m_dino[offset] & SIB_SOUND_TX_DMA_EN);
+		COMBINE_DATA(&m_dino[offset]);
+		m_dino[offset] = (m_dino[offset] & ~SIB_SOUND_DMA_PTR) | preserved;
+
+		if (!was_running && (m_dino[offset] & SIB_SOUND_TX_DMA_EN))
+		{
+			// A fresh transfer starts at the beginning of the buffer.
+			m_dino[offset] &= ~SIB_SOUND_DMA_PTR;
+			m_sound_dma_half_signalled = false;
+			m_dmadac->flush();
+		}
+		break;
+	}
 
 	case DINO_MBUS_CONTROL1:
 		COMBINE_DATA(&m_dino[offset]);
