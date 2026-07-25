@@ -646,6 +646,7 @@ public:
 		, m_rom(*this, "maincpu")
 		, m_boot_mode(*this, "BOOT_MODE")
 		, m_rtc_resume(*this, "RTC_RESUME")
+		, m_battery(*this, "BATTERY")
 		, m_option_button(*this, "OPTION_BUTTON")
 		, m_touch_x(*this, "TOUCH_X")
 		, m_touch_y(*this, "TOUCH_Y")
@@ -784,6 +785,8 @@ private:
 	void set_phone_line(bool connected, bool signal_edge);
 	void restore_inputs();
 	u16 touch_adc_value() const;
+	u16 main_battery_reading() const;
+	u16 backup_battery_reading() const;
 	u32 uart_interrupt_r() const;
 	u32 uart_control_r(unsigned channel) const;
 	u32 uart_hold_r(unsigned channel);
@@ -823,6 +826,7 @@ private:
 	required_region_ptr<u32> m_rom;
 	required_ioport m_boot_mode;
 	required_ioport m_rtc_resume;
+	required_ioport m_battery;
 	required_ioport m_option_button;
 	required_ioport m_touch_x;
 	required_ioport m_touch_y;
@@ -1250,7 +1254,9 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 		}
 
 		if (reg == 10)
+		{
 			m_betty[11] = 0x8000 | ((touch_adc_value() & 0x03ff) << 5);
+		}
 		if (reg == 2)
 			m_betty_pos_pending &= m_betty[2];
 		else if (reg == 3)
@@ -1322,18 +1328,57 @@ void datarover_state::restore_inputs()
 }
 
 
+u16 datarover_state::main_battery_reading() const
+{
+	// Full charge reads at the calibration record's full point, so the OS
+	// reports 100%.  "Low" sits under the 320-count warning threshold but
+	// above empty; "empty" is below the 80-count floor, which is what the OS
+	// treats as a flat cell.
+	switch (BIT(m_battery->read(), 0, 2))
+	{
+	case 1:  return 200;   // between empty (80) and the 320 warning point
+	case 2:  return 60;    // below empty
+	default: return 800;   // the record's full point, so the OS reports 100%
+	}
+}
+
+
+u16 datarover_state::backup_battery_reading() const
+{
+	// The backup cell's thresholds are 400 empty, 816 low.  A healthy reading
+	// has to clear 816: the driver used to answer 340 here, below even the
+	// empty point, so every boot posted "your backup battery is almost out of
+	// power".
+	switch (BIT(m_battery->read(), 2, 2))
+	{
+	case 1:  return 700;   // between empty (400) and the 816 warning point
+	case 2:  return 300;   // below empty; the OS posts "completely out of power"
+	default: return 1000;  // clears the warning point with margin
+	}
+}
+
+
 u16 datarover_state::touch_adc_value() const
 {
-	// The power servers use Betty ADC inputs 24 and 28 for the main and
-	// backup batteries.  Supply nominal healthy readings between the
-	// Apollo calibration table's low/full thresholds.
+	// MainBatteryServer_InitAtoDChannel and its backup counterpart select
+	// Betty ADC inputs 24 and 28.  BatteryServer_CalculateLevel turns a
+	// reading into a percentage between the "empty" and "full" fields taken
+	// from the Apollo calibration record the ROM picks for Betty revision 1,
+	// and warns below the "low" field:
+	//
+	//              empty   low    full
+	//   main  (24)    80    320    800   record 0x13e96dc0
+	//   backup(28)   400    816   1600   record 0x13e96e20
+	//
+	// The backup channel's full point sits above the 10-bit reading the ADC
+	// returns, so a healthy cell reads mid-scale rather than 100%.
 	switch (m_betty[10] & 0x001d)
 	{
 	case 0x18:
-		return 800;
+		return main_battery_reading();
 
 	case 0x1c:
-		return 340;
+		return backup_battery_reading();
 	}
 
 	// Apollo's touch macro selects the electrode arrangement through Betty's
@@ -2257,6 +2302,19 @@ static INPUT_PORTS_START(datarover840)
 	// real communicator does.  That makes every run of a headless regression
 	// see a different time of day, so automated checks can pin the clock to the
 	// value stored in NVRAM instead and get reproducible behavior.
+	// Battery levels are what the OS samples on Betty ADC inputs 24 and 28.
+	// The defaults are healthy; the other settings exist so the low-battery
+	// paths can be exercised without waiting for a cell to run down.
+	PORT_START("BATTERY")
+	PORT_CONFNAME(0x03, 0x00, "Main battery")
+	PORT_CONFSETTING(0x00, "Full")
+	PORT_CONFSETTING(0x01, "Low")
+	PORT_CONFSETTING(0x02, "Empty")
+	PORT_CONFNAME(0x0c, 0x00, "Backup battery")
+	PORT_CONFSETTING(0x00, "Good")
+	PORT_CONFSETTING(0x04, "Low")
+	PORT_CONFSETTING(0x08, "Empty")
+
 	PORT_START("RTC_RESUME")
 	PORT_CONFNAME(0x01, 0x01, "RTC on resume")
 	PORT_CONFSETTING(0x01, "Advance by host clock")
