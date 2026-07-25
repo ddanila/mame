@@ -1648,9 +1648,11 @@ void datarover_state::advance_sound_dma()
 		m_sound_dma_half_signalled = false;
 		ptr = 0;
 
-		// Looping playback restarts on its own; a one-shot buffer stops and
-		// leaves the OS to queue the next one.
-		if (!(m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_LOOP))
+		// The normal mode is a continuously serviced two-half ring.  The ROM
+		// fills each half from its half/full interrupt handlers without setting
+		// kSibSoundDmaLoopMask.  Only an explicitly requested one-shot transfer
+		// stops at the end.
+		if (m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_ONCE)
 			m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_TX_DMA_EN;
 	}
 
