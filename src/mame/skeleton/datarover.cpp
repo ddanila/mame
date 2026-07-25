@@ -695,6 +695,16 @@ private:
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
 	static constexpr u32 DINO_POWER_CONTROL = 0x1c4 / 4;
+	static constexpr u32 DINO_INTERRUPT_PENDING_MASK = 0xc000'0000;
+	static constexpr u32 DINO_INTERRUPT_LOW_PRIORITY = 0x4000'0000;
+	static constexpr u32 DINO_INTERRUPT_GLOBAL_ENABLE = 0x0004'0000;
+	static constexpr u32 DINO_ON_BUTTON_POSITIVE = 0x0080'0000;
+	static constexpr u32 DINO_ON_BUTTON_NEGATIVE = 0x0040'0000;
+	static constexpr u32 DINO_POWER_ON_BUTTON_STATUS = 0x8000'0000;
+	static constexpr u32 DINO_POWER_OK_STATUS = 0x2000'0000;
+	static constexpr u32 DINO_POWER_STOP_CPU = 0x0000'0010;
+	static constexpr u32 DINO_POWER_VCC_ON = 0x0000'0001;
+	static constexpr u32 DINO_POWER_WRITE_MASK = 0x0000'ffbf;
 	static constexpr u32 GLACIER_IO_DATA_INPUT = 0x00c / 4;
 	static constexpr u32 GLACIER_IO_POS_ENABLE = 0x010 / 4;
 	static constexpr u32 GLACIER_IO_NEG_ENABLE = 0x014 / 4;
@@ -1338,33 +1348,33 @@ INPUT_CHANGED_MEMBER(datarover_state::power_changed)
 {
 	if (newval)
 	{
+		m_dino[DINO_INTERRUPT5] |= DINO_ON_BUTTON_POSITIVE;
 		if (m_maincpu->suspended(SUSPEND_REASON_HALT))
 		{
-			// Dino's on-button is also the wake source.  Hardware restores
-			// VCC and releases StopCpu before presenting the edge interrupt.
-			// Betty is on the switched peripheral rail, so wake begins with
-			// its register file and Dino SIB handshake state reset.
-			m_betty.fill(0);
-			m_betty_pos_pending = 0;
-			m_betty_neg_pending = 0;
-			m_betty[12] = 0x1002;
-			m_dino[DINO_SIB_CONTROL] = 0;
-			m_dino[DINO_SIB_SF0_STATUS] = 0;
-			m_dino[DINO_SIB_SF1_STATUS] = 0;
-			m_dino[DINO_INTERRUPT1] &= ~0x0000'05e0;
-			m_sib_timer->reset();
-			m_sound_timer->reset();
-			m_dino[DINO_POWER_CONTROL] |= 0x0000'0001;
-			m_dino[DINO_POWER_CONTROL] &= ~0x0000'0010;
+			// The on-button releases StopCpu for both doze (VCC retained)
+			// and power-down (VCC removed).  Only the latter resets Betty
+			// and the SIB state on its switched peripheral rail.
+			if (!BIT(m_dino[DINO_POWER_CONTROL], 0))
+			{
+				m_betty.fill(0);
+				m_betty_pos_pending = 0;
+				m_betty_neg_pending = 0;
+				m_betty[12] = 0x1002;
+				m_dino[DINO_SIB_CONTROL] = 0;
+				m_dino[DINO_SIB_SF0_STATUS] = 0;
+				m_dino[DINO_SIB_SF1_STATUS] = 0;
+				m_dino[DINO_INTERRUPT1] &= ~0x0000'05e0;
+				m_sib_timer->reset();
+				m_sound_timer->reset();
+			}
+			m_dino[DINO_POWER_CONTROL] |= DINO_POWER_VCC_ON;
+			m_dino[DINO_POWER_CONTROL] &= ~DINO_POWER_STOP_CPU;
 			m_maincpu->resume(SUSPEND_REASON_HALT);
 		}
-		m_dino[DINO_POWER_CONTROL] |= 0x8000'0000;
-		m_dino[DINO_INTERRUPT5] |= 0x0080'0000;
 	}
 	else
 	{
-		m_dino[DINO_POWER_CONTROL] &= ~0x8000'0000;
-		m_dino[DINO_INTERRUPT5] |= 0x0040'0000;
+		m_dino[DINO_INTERRUPT5] |= DINO_ON_BUTTON_NEGATIVE;
 	}
 
 	update_irq();
@@ -1396,7 +1406,7 @@ void datarover_state::update_irq()
 {
 	bool pending = false;
 
-	if (BIT(m_dino[DINO_INTERRUPT6_ENABLE], 18))
+	if (m_dino[DINO_INTERRUPT6_ENABLE] & DINO_INTERRUPT_GLOBAL_ENABLE)
 	{
 		for (unsigned bank = 0; bank < 5; ++bank)
 		{
@@ -1405,6 +1415,24 @@ void datarover_state::update_irq()
 					: m_dino[DINO_INTERRUPT1 + bank];
 			pending |= bool(status & m_dino[DINO_INTERRUPT1_ENABLE + bank]);
 		}
+	}
+
+	// Interrupt 6 is Dino's read-only summary bank.  DeepDoze polls its
+	// high/low pending bits with CPU interrupts masked, so asserting only
+	// the R3900 input line leaves the ROM's wake loop spinning forever.
+	m_dino[DINO_INTERRUPT6] &= ~DINO_INTERRUPT_PENDING_MASK;
+	if (pending)
+		m_dino[DINO_INTERRUPT6] |= DINO_INTERRUPT_LOW_PRIORITY;
+
+	// StopCpu is released by an enabled interrupt while VCC remains on.
+	// Power-down keeps VCC clear and can only be resumed by the on-button
+	// path above.
+	if (pending
+			&& BIT(m_dino[DINO_POWER_CONTROL], 0)
+			&& m_maincpu->suspended(SUSPEND_REASON_HALT))
+	{
+		m_dino[DINO_POWER_CONTROL] &= ~DINO_POWER_STOP_CPU;
+		m_maincpu->resume(SUSPEND_REASON_HALT);
 	}
 
 	// Dino's general interrupt is IP4 (Cause bit 12), MIPS input line 2.
@@ -1604,7 +1632,9 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 	case DINO_POWER_CONTROL:
 		// Power-good is a read-only status input.  Without it, the low-level
 		// boot path immediately invokes CommonShutdown and restarts forever.
-		return m_dino[offset] | 0x2000'0000;
+		return (m_dino[offset] & ~DINO_POWER_ON_BUTTON_STATUS)
+				| DINO_POWER_OK_STATUS
+				| (m_power_button->read() ? DINO_POWER_ON_BUTTON_STATUS : 0);
 
 	default:
 		return m_dino[offset];
@@ -1706,9 +1736,8 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	case DINO_POWER_CONTROL:
 	{
 		u32 const old_control = m_dino[offset];
-		u32 const status = m_dino[offset] & 0xe000'0000;
-		COMBINE_DATA(&m_dino[offset]);
-		m_dino[offset] = (m_dino[offset] & ~0xe000'0000) | status;
+		u32 const write_mask = mem_mask & DINO_POWER_WRITE_MASK;
+		m_dino[offset] = (old_control & ~write_mask) | (data & write_mask);
 
 		// The low-level Betty reset uses Dino's stop timer as a short,
 		// polled delay.  Complete it synchronously until the stop timer gets
@@ -1723,11 +1752,11 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 			persist_rtc();
 			machine().schedule_exit();
 		}
-		else if (BIT(old_control, 0) && !BIT(m_dino[offset], 0)
-				&& BIT(m_dino[offset], 4))
+		else if ((!BIT(old_control, 4) && BIT(m_dino[offset], 4))
+				|| (BIT(old_control, 0) && !BIT(m_dino[offset], 0)))
 		{
-			// The normal power-button path is suspend-to-RAM, not loss of
-			// battery-backed state.  An on-button edge resumes this CPU.
+			// StopCpu is Doze's stop request.  Removing VCC also stops the
+			// CPU even if a pending interrupt released an earlier StopCpu.
 			persist_rtc();
 			m_maincpu->suspend(SUSPEND_REASON_HALT, true);
 		}
@@ -1742,9 +1771,12 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	case DINO_INTERRUPT3:
 	case DINO_INTERRUPT4:
 	case DINO_INTERRUPT5:
-	case DINO_INTERRUPT6:
 		// Dino interrupt status registers are write-to-clear.
 		m_dino[offset] &= ~(data & mem_mask);
+		break;
+
+	case DINO_INTERRUPT6:
+		// Bank 6 is the read-only priority summary.
 		break;
 
 	default:
