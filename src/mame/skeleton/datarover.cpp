@@ -1674,7 +1674,13 @@ void datarover_state::advance_telecom_dma()
 		m_dino[DINO_INTERRUPT1] |= INT1_TEL_DMA_END;
 		m_telecom_dma_half_signalled = false;
 		ptr = 0;
-		if (!(m_dino[DINO_SIB_DMA] & SIB_TEL_DMA_LOOP))
+
+		// The software modem uses the buffer as a continuously serviced
+		// two-half ring: SibCmdStartTelecom enables RX/TX without setting
+		// kSibTelDmaOnceMask or kSibTelDmaLoopMask, and its half/full
+		// interrupt handlers process each 48-sample half in place.  Only an
+		// explicitly requested one-shot transfer stops at the end.
+		if (m_dino[DINO_SIB_DMA] & SIB_TEL_DMA_ONCE)
 			m_dino[DINO_SIB_DMA] &= ~(SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN);
 	}
 
@@ -1726,14 +1732,14 @@ void datarover_state::update_sib_timers()
 
 TIMER_CALLBACK_MEMBER(datarover_state::telecom_tick)
 {
-	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 5))
-		return;
-
-	if (m_dino[DINO_SIB_DMA] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN))
+	if (telecom_dma_running())
 	{
 		advance_telecom_dma();
 		return;
 	}
+
+	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 5))
+		return;
 
 	// Unbuffered telecom: one hold-register slot is free.
 	m_dino[DINO_INTERRUPT1] |= INT1_TEL_RECEIVE;
@@ -1857,16 +1863,16 @@ TIMER_CALLBACK_MEMBER(datarover_state::sib_tick)
 
 TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 {
-	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 4))
-		return;
-
 	// Buffered playback owns the sample clock while transmit DMA is enabled;
 	// the hold register is only serviced when the OS feeds samples by hand.
-	if (m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN)
+	if (sound_dma_running())
 	{
 		advance_sound_dma();
 		return;
 	}
+
+	if (!BIT(m_dino[DINO_SIB_CONTROL], 0) || !BIT(m_dino[DINO_SIB_CONTROL], 4))
+		return;
 
 	// One 32-bit sound-hold slot (two 16-bit samples) is available.
 	m_dino[DINO_INTERRUPT1] |= 0x0000'0400;
@@ -2290,6 +2296,9 @@ void datarover_state::machine_reset()
 	m_rtc_persist_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
 	m_sib_timer->reset();
 	m_sound_timer->reset();
+	m_telecom_timer->reset();
+	m_telecom_dma_half_signalled = false;
+	m_telecom_loopback = 0;
 	m_dmadac->enable(0);
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
