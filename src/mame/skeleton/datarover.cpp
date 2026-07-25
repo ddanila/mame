@@ -716,6 +716,18 @@ private:
 	static constexpr u32 INT1_SOUND_DMA_PTR_INC = 0x0004'0000; // kIntSoundDmaPtrIncMask
 	static constexpr u32 DINO_VIDEO_HIGH_BUFFER = 0x030 / 4;
 	static constexpr u32 DINO_MBUS_CONTROL1 = 0x0e0 / 4;
+
+	// DinoModule.mbusControl1 status bits, from the SDK's Dino.asm.h.
+	static constexpr u32 DINO_MBUS_ENABLED_STATUS = 0x8000'0000; // kMbusEnabledStatusMask
+	static constexpr u32 DINO_MBUS_EMPTY_STATUS = 0x4000'0000;   // kMbusEmptyStatusMask
+	static constexpr u32 DINO_MBUS_INT_STATUS = 0x2000'0000;     // kMbusIntStatusMask
+	static constexpr u32 DINO_MBUS_STATUS =
+			DINO_MBUS_ENABLED_STATUS | DINO_MBUS_EMPTY_STATUS | DINO_MBUS_INT_STATUS;
+
+	// interrupt2 Magic Bus bits, from Dino.asm.h.
+	static constexpr u32 INT2_MBUS_TRANSMIT = 0x0000'0800; // kIntMbusTransmitMask
+	static constexpr u32 INT2_MBUS_EMPTY = 0x0000'0200;    // kIntMbusEmptyMask
+	static constexpr u32 INT2_MBUS_DMA_END = 0x0000'0020;  // kIntMbusDmaEndMask
 	static constexpr u32 DINO_INTERRUPT1 = 0x100 / 4;
 	static constexpr u32 DINO_INTERRUPT2 = 0x104 / 4;
 	static constexpr u32 DINO_INTERRUPT3 = 0x108 / 4;
@@ -1892,6 +1904,18 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 	case DINO_RTC_LOW:
 		return u32(rtc_ticks());
 
+	case DINO_MBUS_CONTROL1:
+		// kMbusEnabledStatusMask follows the module enable, the transmit FIFO
+		// is always empty because commands complete synchronously, and
+		// kMbusIntStatusMask is the Magic Bus request line.  Nothing is
+		// attached, so the line never asserts: TestMBReqLine reads that bit
+		// and GetPollingCommand only fetches a peripheral poll when it is
+		// set, so leaving it clear stops the OS probing a bus with no devices
+		// and then counting the silence as failures.
+		return (m_dino[offset] & ~DINO_MBUS_STATUS)
+				| (BIT(m_dino[offset], 0) ? DINO_MBUS_ENABLED_STATUS : 0)
+				| DINO_MBUS_EMPTY_STATUS;
+
 	case DINO_IO_CONTROL:
 		// Input bits are sampled independently of the writable GPIO fields.
 		// Holding Option during reset enters the IDT monitor; BOOT_MODE keeps
@@ -1997,12 +2021,24 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 
 	case DINO_MBUS_CONTROL1:
+		// Bits 31:29 are status, so a write must not be able to set them.
 		COMBINE_DATA(&m_dino[offset]);
+		m_dino[offset] &= ~DINO_MBUS_STATUS;
 
-		// MagicBus transfers are synchronous for now.  The monitor clears the
-		// transmit status, enables the engine, then polls this completion bit.
+		// Magic Bus transfers are synchronous here: the byte is shifted out
+		// the instant the module is enabled.  The monitor polls the transmit
+		// bit, but the OS also waits for the shifter to drain before it
+		// considers a command finished.  Reporting only "transmit buffer
+		// available" left MagicBus_AssignMagicBusAddress waiting, and the
+		// address assignment it broadcasts every half minute was recorded as
+		// a peripheral failure until the count reached the ROM's limit and it
+		// warned about an attached device that was never there.
 		if (BIT(m_dino[offset], 0))
-			m_dino[DINO_INTERRUPT2] |= 0x00000800;
+		{
+			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT | INT2_MBUS_EMPTY;
+			if (BIT(m_dino[offset], 15))
+				m_dino[DINO_INTERRUPT2] |= INT2_MBUS_DMA_END;
+		}
 		break;
 
 	case DINO_TIMER_CONTROL:
