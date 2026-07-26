@@ -53,6 +53,8 @@
 
 class datarover_uart_device;
 DECLARE_DEVICE_TYPE(DATAROVER_UART, datarover_uart_device)
+class datarover_irda_device;
+DECLARE_DEVICE_TYPE(DATAROVER_IRDA, datarover_irda_device)
 
 class datarover_uart_device :
 	public device_t,
@@ -136,6 +138,81 @@ void datarover_uart_device::tra_complete()
 void datarover_uart_device::received_byte(u8 byte)
 {
 	m_received_handler(byte);
+}
+
+
+class datarover_irda_device :
+	public device_t,
+	public device_pty_interface
+{
+public:
+	datarover_irda_device(
+			machine_config const &mconfig,
+			char const *tag,
+			device_t *owner,
+			u32 clock = 0);
+
+	auto received_handler() { return m_received_handler.bind(); }
+
+	void transmit(u8 data)
+	{
+		write(data);
+	}
+
+protected:
+	virtual void device_start() override ATTR_COLD;
+	virtual void device_stop() override ATTR_COLD;
+	virtual void device_reset() override ATTR_COLD;
+
+private:
+	TIMER_CALLBACK_MEMBER(poll);
+
+	devcb_write8 m_received_handler;
+	emu_timer *m_poll_timer = nullptr;
+};
+
+DEFINE_DEVICE_TYPE(
+		DATAROVER_IRDA,
+		datarover_irda_device,
+		"datarover_irda",
+		"DataRover IrDA SIR Port")
+
+datarover_irda_device::datarover_irda_device(
+		machine_config const &mconfig,
+		char const *tag,
+		device_t *owner,
+		u32 clock)
+	: device_t(mconfig, DATAROVER_IRDA, tag, owner, clock)
+	, device_pty_interface(mconfig, *this)
+	, m_received_handler(*this)
+{
+}
+
+void datarover_irda_device::device_start()
+{
+	open();
+	m_poll_timer = timer_alloc(FUNC(datarover_irda_device::poll), this);
+	m_poll_timer->adjust(attotime::zero, 0, attotime::from_msec(1));
+}
+
+void datarover_irda_device::device_stop()
+{
+	close();
+}
+
+void datarover_irda_device::device_reset()
+{
+}
+
+TIMER_CALLBACK_MEMBER(datarover_irda_device::poll)
+{
+	u8 input[1024];
+	ssize_t const count = read(input, std::size(input));
+	if (count > 0)
+	{
+		for (ssize_t index = 0; index < count; ++index)
+			m_received_handler(input[index]);
+	}
 }
 
 
@@ -638,6 +715,7 @@ public:
 		, m_terminal(*this, "terminal")
 		, m_uart(*this, "uart%u", 1U)
 		, m_rs232(*this, "rs232%u", 1U)
+		, m_irda(*this, "irda")
 		, m_dmadac(*this, "speaker_dac")
 		, m_magicbus_keyboard(*this, "magicbus_keyboard")
 		, m_pccard(*this, "pccard%u", 1U)
@@ -657,6 +735,7 @@ public:
 		, m_power_button(*this, "POWER_BUTTON")
 		, m_phone_line(*this, "PHONE_LINE")
 		, m_magicbus_accessory(*this, "MAGICBUS_ACCESSORY")
+		, m_irda_carrier(*this, "IRDA_CARRIER")
 	{
 	}
 
@@ -667,6 +746,7 @@ public:
 	INPUT_CHANGED_MEMBER(power_changed);
 	INPUT_CHANGED_MEMBER(phone_line_changed);
 	INPUT_CHANGED_MEMBER(battery_cover_changed);
+	INPUT_CHANGED_MEMBER(irda_carrier_changed);
 
 protected:
 	virtual void machine_start() override ATTR_COLD;
@@ -677,6 +757,14 @@ private:
 	static constexpr u32 DINO_UART_A_HOLD = 0x0c4 / 4;
 	static constexpr u32 DINO_UART_B_CONTROL1 = 0x0c8 / 4;
 	static constexpr u32 DINO_UART_B_HOLD = 0x0dc / 4;
+	static constexpr u32 DINO_UART_ENABLED_STATUS = 0x8000'0000;
+	static constexpr u32 DINO_UART_EMPTY_STATUS = 0x4000'0000;
+	static constexpr u32 DINO_UART_PRX_HOLD_FULL = 0x2000'0000;
+	static constexpr u32 DINO_UART_RX_HOLD_FULL = 0x1000'0000;
+	static constexpr u32 DINO_UART_STATUS =
+			DINO_UART_ENABLED_STATUS | DINO_UART_EMPTY_STATUS
+			| DINO_UART_PRX_HOLD_FULL | DINO_UART_RX_HOLD_FULL;
+	static constexpr u32 DINO_UART_PULSED_MODE = 0x0000'0300;
 	static constexpr u32 DINO_SIB_SF0_AUX = 0x080 / 4;
 	static constexpr u32 DINO_SIB_SF1_AUX = 0x084 / 4;
 	static constexpr u32 DINO_SIB_SF0_STATUS = 0x088 / 4;
@@ -764,6 +852,9 @@ private:
 	static constexpr u32 DINO_IO_COVER_OPEN = 0x0000'0004;
 	static constexpr u32 INT5_COVER_OPEN_POS = 0x0000'0200;   // kIntIOInt2PosMask
 	static constexpr u32 INT5_COVER_OPEN_NEG = 0x0000'0004;   // kIntIOInt2NegMask
+	static constexpr u32 INT5_IR_CARRIER_PIN = 0x0001'0000;   // kIntCarDetPinMask
+	static constexpr u32 INT5_IR_CARRIER_POS = 0x0000'8000;   // kIntCarDetPosMask
+	static constexpr u32 INT5_IR_CARRIER_NEG = 0x0000'4000;   // kIntCarDetNegMask
 	static constexpr u32 DINO_POWER_CONTROL = 0x1c4 / 4;
 	static constexpr u32 DINO_INTERRUPT_PENDING_MASK = 0xc000'0000;
 	static constexpr u32 DINO_INTERRUPT_LOW_PRIORITY = 0x4000'0000;
@@ -826,6 +917,8 @@ private:
 	u32 uart_control_r(unsigned channel) const;
 	u32 uart_hold_r(unsigned channel);
 	void uart_hold_w(unsigned channel, u32 data, u32 mem_mask);
+	bool uart_pulsed(unsigned channel) const;
+	void irda_received(u8 data);
 	void terminal_key(u8 data);
 	template <unsigned Channel> void uart_received(u8 data);
 	void update_irq();
@@ -857,6 +950,7 @@ private:
 	required_device<generic_terminal_device> m_terminal;
 	required_device_array<datarover_uart_device, 2> m_uart;
 	required_device_array<rs232_port_device, 2> m_rs232;
+	required_device<datarover_irda_device> m_irda;
 	required_device<dmadac_sound_device> m_dmadac;
 	required_device<at_keyboard_device> m_magicbus_keyboard;
 	required_device_array<pccard_slot_device, 2> m_pccard;
@@ -876,6 +970,7 @@ private:
 	required_ioport m_power_button;
 	required_ioport m_phone_line;
 	required_ioport m_magicbus_accessory;
+	required_ioport m_irda_carrier;
 
 	std::array<u32, 0x200 / 4> m_dino{};
 	std::array<u32, 0x24 / 4> m_glacier1{};
@@ -1206,13 +1301,15 @@ u32 datarover_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 u32 datarover_state::uart_control_r(unsigned channel) const
 {
-	// Report transmitter ready/empty using both status encodings found in
-	// the monitor's Sony/Toshiba tables.
-	u32 result = 0x05014000;
+	u32 const control =
+			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1];
+	u32 result = (control & ~DINO_UART_STATUS) | DINO_UART_EMPTY_STATUS;
+	if (BIT(control, 0))
+		result |= DINO_UART_ENABLED_STATUS;
 	if (m_uart_rx_count[channel])
-		result |= 0x10000000;
+		result |= DINO_UART_RX_HOLD_FULL;
 	if (m_uart_rx_count[channel] > 1)
-		result |= 0x20000000;
+		result |= DINO_UART_PRX_HOLD_FULL;
 
 	return result;
 }
@@ -1238,17 +1335,51 @@ void datarover_state::uart_hold_w(unsigned channel, u32 data, u32 mem_mask)
 	if (ACCESSING_BITS_0_7)
 	{
 		u8 const character = data;
-		m_terminal->write(character);
-		if (m_rs232[channel]->get_card_device())
-			m_uart[channel]->transmit(character);
+		if (uart_pulsed(channel))
+		{
+			m_irda->transmit(character);
+		}
+		else
+		{
+			m_terminal->write(character);
+			if (m_rs232[channel]->get_card_device())
+				m_uart[channel]->transmit(character);
+		}
 		m_dino[DINO_INTERRUPT2] |= channel ? 0x0001'0000 : 0x0400'0000;
 		logerror(
-				"UART%c TX: %02x %c\n",
+				"UART%c%s TX: %02x %c\n",
 				'A' + channel,
+				uart_pulsed(channel) ? " IrDA" : "",
 				character,
 				(character >= 0x20 && character < 0x7f) ? character : '.');
 		update_irq();
 	}
+}
+
+
+bool datarover_state::uart_pulsed(unsigned channel) const
+{
+	u32 const control =
+			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1];
+	return bool(control & DINO_UART_PULSED_MODE);
+}
+
+
+void datarover_state::irda_received(u8 data)
+{
+	for (unsigned channel = 0; channel < 2; ++channel)
+	{
+		if (uart_pulsed(channel))
+		{
+			if (channel)
+				uart_received<1>(data);
+			else
+				uart_received<0>(data);
+			return;
+		}
+	}
+
+	logerror("IrDA RX dropped while neither UART is in pulsed mode: %02x\n", data);
 }
 
 
@@ -1545,6 +1676,17 @@ INPUT_CHANGED_MEMBER(datarover_state::battery_cover_changed)
 	// is the negative one.  MainBatteryCoverPositive and its negative
 	// counterpart are the ROM's handlers.
 	m_dino[DINO_INTERRUPT5] |= newval ? INT5_COVER_OPEN_POS : INT5_COVER_OPEN_NEG;
+	update_irq();
+}
+
+
+INPUT_CHANGED_MEMBER(datarover_state::irda_carrier_changed)
+{
+	// The DataRover's IrDA transceiver drives Dino's carrier-detect pin.
+	// SerialServerDinoIrDA enables its positive-edge interrupt while waiting
+	// for a peer, using the edge to wake the IrLAP daemon before bytes arrive.
+	m_dino[DINO_INTERRUPT5] |=
+			newval ? INT5_IR_CARRIER_POS : INT5_IR_CARRIER_NEG;
 	update_irq();
 }
 
@@ -2214,6 +2356,10 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 	case DINO_INTERRUPT2:
 		return uart_interrupt_r();
 
+	case DINO_INTERRUPT5:
+		return (m_dino[offset] & ~INT5_IR_CARRIER_PIN)
+				| (m_irda_carrier->read() ? INT5_IR_CARRIER_PIN : 0);
+
 	case DINO_RTC_HIGH:
 		return u32(rtc_ticks() >> 32) & 0xff;
 
@@ -2757,6 +2903,12 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFNAME(0x01, 0x01, "Magic Bus accessory")
 	PORT_CONFSETTING(0x01, "AT keyboard")
 	PORT_CONFSETTING(0x00, "None")
+
+	PORT_START("IRDA_CARRIER")
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER)
+		PORT_NAME("IrDA carrier")
+		PORT_CHANGED_MEMBER(
+				DEVICE_SELF, FUNC(datarover_state::irda_carrier_changed), 0)
 INPUT_PORTS_END
 
 
@@ -2835,6 +2987,8 @@ void datarover_state::datarover840(machine_config &config)
 	}
 	m_uart[0]->received_handler().set(FUNC(datarover_state::uart_received<0>));
 	m_uart[1]->received_handler().set(FUNC(datarover_state::uart_received<1>));
+	DATAROVER_IRDA(config, m_irda, 0);
+	m_irda->received_handler().set(FUNC(datarover_state::irda_received));
 
 	SPEAKER(config, "speaker").front_center();
 	DMADAC(config, m_dmadac).add_route(ALL_OUTPUTS, "speaker", 0.5);
