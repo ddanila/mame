@@ -230,7 +230,7 @@ void etherlink_iii_pccard_device::execute_command(u16 command)
 }
 
 
-u16 etherlink_iii_pccard_device::register_r(u8 offset)
+u16 etherlink_iii_pccard_device::register_r(u8 offset, u16 mem_mask)
 {
 	if (offset == 0x0e)
 	{
@@ -258,11 +258,16 @@ u16 etherlink_iii_pccard_device::register_r(u8 offset)
 		{
 		case 0x00:
 		case 0x02:
-			return fifo_r(0xffff);
+			// PIO reads advance only the byte lanes the host accessed.
+			return fifo_r(mem_mask);
 		case 0x08:
 			return m_receive_data.empty()
 					? 0x8000
-					: u16(m_receive_data.size() & 0x07ff);
+					: u16((m_receive_data.size()
+							- std::min<std::size_t>(
+									m_receive_position,
+									m_receive_data.size()))
+							& 0x07ff);
 		case 0x0a:
 			return u16(m_transmit_status) << 8; // timer is low byte
 		case 0x0c:
@@ -467,9 +472,17 @@ int etherlink_iii_pccard_device::recv_start_cb(u8 *buf, int length)
 
 	m_receive_data.assign(buf, buf + length);
 	m_receive_position = 0;
+	return length;
+}
+
+
+void etherlink_iii_pccard_device::recv_complete_cb(int result)
+{
+	if (!result || m_receive_data.empty())
+		return;
+
 	m_pending |= RX_COMPLETE;
 	update_irq();
-	return length;
 }
 
 
@@ -485,7 +498,7 @@ void etherlink_iii_pccard_device::discard_receive()
 u16 etherlink_iii_pccard_device::io_r(u8 offset, u16 mem_mask)
 {
 	offset &= 0x0e;
-	u16 const value = register_r(offset);
+	u16 const value = register_r(offset, mem_mask);
 	return (value & mem_mask) | ~mem_mask;
 }
 
