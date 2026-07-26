@@ -170,6 +170,18 @@ function osdmodulesbuild()
 		ext_includedir("asio"),
 	}
 
+	if _OPTIONS["USE_SLIRP"]=="1" then
+		files {
+			MAME_DIR .. "src/osd/modules/netdev/slirp.cpp",
+		}
+		defines {
+			"OSD_NET_USE_SLIRP",
+		}
+		buildoptions {
+			backtick(pkgconfigcmd() .. " --cflags slirp"),
+		}
+	end
+
 	if _OPTIONS["targetos"]=="windows" then
 		includedirs {
 			MAME_DIR .. "3rdparty/winpcap/Include",
@@ -606,6 +618,12 @@ function osdmodulestargetconf()
 		addlibfromstring(str)
 		addoptionsfromstring(str)
 	end
+
+	if _OPTIONS["USE_SLIRP"]=="1" then
+		local str = backtick(pkgconfigcmd() .. " --libs slirp")
+		addlibfromstring(str)
+		addoptionsfromstring(str)
+	end
 end
 
 
@@ -624,6 +642,15 @@ newoption {
 	allowed = {
 		{ "0",  "Don't include pcap network module" },
 		{ "1",  "Include pcap network module" },
+	},
+}
+
+newoption {
+	trigger = "USE_SLIRP",
+	description = "Include libslirp user-mode network module",
+	allowed = {
+		{ "0",  "Don't include libslirp network module" },
+		{ "1",  "Include libslirp network module" },
 	},
 }
 
@@ -753,6 +780,15 @@ if not _OPTIONS["USE_PCAP"] then
 		_OPTIONS["USE_PCAP"] = "1"
 	else
 		_OPTIONS["USE_PCAP"] = "0"
+	end
+end
+
+if not _OPTIONS["USE_SLIRP"] then
+	if _OPTIONS["targetos"]=="linux"
+			and os.execute(pkgconfigcmd() .. " --exists slirp") then
+		_OPTIONS["USE_SLIRP"] = "1"
+	else
+		_OPTIONS["USE_SLIRP"] = "0"
 	end
 end
 

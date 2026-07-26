@@ -289,6 +289,9 @@ void osd_common_t::register_options()
 	REGISTER_MODULE(m_mod_man, NETDEV_TAPTUN);
 	REGISTER_MODULE(m_mod_man, NETDEV_PCAP);
 	REGISTER_MODULE(m_mod_man, NETDEV_UDP);
+#if defined(OSD_NET_USE_SLIRP)
+	REGISTER_MODULE(m_mod_man, NETDEV_SLIRP);
+#endif
 	REGISTER_MODULE(m_mod_man, NETDEV_NONE);
 
 #ifndef NO_USE_MIDI
