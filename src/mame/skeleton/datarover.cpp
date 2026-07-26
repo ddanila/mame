@@ -31,6 +31,7 @@
 
 #include "emu.h"
 
+#include "bus/pccard/3c589.h"
 #include "bus/pccard/pccard.h"
 #include "bus/rs232/rs232.h"
 #include "cpu/mips/mips1.h"
@@ -2923,6 +2924,7 @@ DEVICE_INPUT_DEFAULTS_END
 
 static void datarover_pccards(device_slot_interface &device)
 {
+	device.option_add("3c589", ETHERLINK_III_PCCARD);
 	device.option_add("linear", DATAROVER_LINEAR_PCCARD);
 	device.option_add("modem", DATAROVER_MODEM_PCCARD);
 }

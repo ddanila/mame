@@ -4402,6 +4402,8 @@ if BUSES["PCCARD"] then
 		MAME_DIR .. "src/devices/bus/pccard/pccard.h",
 		MAME_DIR .. "src/devices/bus/pccard/ataflash.cpp",
 		MAME_DIR .. "src/devices/bus/pccard/ataflash.h",
+		MAME_DIR .. "src/devices/bus/pccard/3c589.cpp",
+		MAME_DIR .. "src/devices/bus/pccard/3c589.h",
 		MAME_DIR .. "src/devices/bus/pccard/k573npu.cpp",
 		MAME_DIR .. "src/devices/bus/pccard/k573npu.h",
 		MAME_DIR .. "src/devices/bus/pccard/konami_dual.cpp",
