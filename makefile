@@ -37,6 +37,7 @@
 # NO_USE_PIPEWIRE = 1
 # USE_TAPTUN = 1
 # USE_PCAP = 1
+# USE_SLIRP = 1
 # USE_QTDEBUG = 1
 # NO_X11 = 1
 # NO_USE_XINPUT = 1
@@ -717,6 +718,10 @@ endif
 
 ifdef USE_PCAP
 PARAMS += --USE_PCAP='$(USE_PCAP)'
+endif
+
+ifdef USE_SLIRP
+PARAMS += --USE_SLIRP='$(USE_SLIRP)'
 endif
 
 ifdef NO_OPENGL
