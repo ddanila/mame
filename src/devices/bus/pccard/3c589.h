@@ -88,6 +88,8 @@ private:
 	u16 m_transmit_length = 0;
 	u16 m_transmit_header_words = 0;
 	u16 m_receive_position = 0;
+	u8 m_transmit_status = 0;
+	bool m_transmit_interrupt = false;
 	bool m_receiver_enabled = false;
 	bool m_transmitter_enabled = false;
 	bool m_statistics_enabled = false;
