@@ -34,6 +34,7 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 
 	virtual int recv_start_cb(u8 *buf, int length) override;
+	virtual void recv_complete_cb(int result) override;
 
 private:
 	static constexpr u32 CONFIG_BASE = 0x1000;
@@ -56,7 +57,7 @@ private:
 	void execute_command(u16 command);
 	u16 io_r(u8 offset, u16 mem_mask);
 	void io_w(u8 offset, u16 data, u16 mem_mask);
-	u16 register_r(u8 offset);
+	u16 register_r(u8 offset, u16 mem_mask);
 	void register_w(u8 offset, u16 data, u16 mem_mask);
 	u16 fifo_r(u16 mem_mask);
 	void fifo_w(u16 data, u16 mem_mask);
