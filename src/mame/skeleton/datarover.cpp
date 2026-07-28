@@ -25,7 +25,6 @@
     TODO:
       - add the remaining TX39-specific CP0 and MAC behaviour
       - replace Dino register shadows with functional devices
-      - make the modeled power-supply rail outputs affect their consumers
 
 ***************************************************************************/
 
@@ -824,6 +823,7 @@ public:
 	INPUT_CHANGED_MEMBER(pccard_battery_changed);
 	INPUT_CHANGED_MEMBER(power_changed);
 	INPUT_CHANGED_MEMBER(phone_line_changed);
+	INPUT_CHANGED_MEMBER(main_battery_changed);
 	INPUT_CHANGED_MEMBER(battery_cover_changed);
 	INPUT_CHANGED_MEMBER(irda_carrier_changed);
 
@@ -921,6 +921,15 @@ private:
 	static constexpr u32 DINO_TIMER_CONTROL = 0x150 / 4;
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
+	static constexpr u32 DINO_MFIO_DATA_OUTPUT = 0x184 / 4;
+
+	// Apollo's platform-specific MFIO assignments from Gen2MFS.asm.h.
+	// The LCD and charger signals are active high; Magic Bus Vcc-off is
+	// active high, so its attached peripheral is powered while this bit is
+	// clear.
+	static constexpr u32 DINO_MFIO_LCD_POWER = 0x0002'0000;
+	static constexpr u32 DINO_MFIO_MBUS_VCC_OFF = 0x0001'0000;
+	static constexpr u32 DINO_MFIO_CHARGER_ENABLE = 0x0000'0002;
 
 	// PowerSupplyGen2MFS reads the external-power and battery-cover inputs
 	// from these bits: ACAdapterAttached takes powerControl bit 30, and
@@ -994,6 +1003,8 @@ private:
 	u16 touch_adc_value() const;
 	u16 main_battery_reading() const;
 	u16 backup_battery_reading() const;
+	bool magicbus_powered() const;
+	bool main_battery_charging() const;
 	u32 uart_interrupt_r() const;
 	u32 uart_control_r(unsigned channel) const;
 	u32 uart_hold_r(unsigned channel);
@@ -1024,6 +1035,7 @@ private:
 	TIMER_CALLBACK_MEMBER(telecom_tick);
 	TIMER_CALLBACK_MEMBER(sound_tick);
 	TIMER_CALLBACK_MEMBER(magicbus_keyboard_tick);
+	TIMER_CALLBACK_MEMBER(battery_charge_tick);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 
 	required_device<r3900_device> m_maincpu;
@@ -1097,9 +1109,11 @@ private:
 	std::array<u8, 256> m_magicbus_key_data{};
 	u16 m_magicbus_key_head = 0;
 	u16 m_magicbus_key_count = 0;
+	u16 m_main_battery_charge = 0;
 	emu_timer *m_telecom_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
 	emu_timer *m_magicbus_keyboard_timer = nullptr;
+	emu_timer *m_battery_charge_timer = nullptr;
 };
 
 
@@ -1373,6 +1387,14 @@ u32 datarover_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 	(void)screen;
 
+	// Apollo drives the panel supply from MFIO 17.  The framebuffer remains
+	// intact while the rail is off, just as it does through normal suspend.
+	if (!(m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_LCD_POWER))
+	{
+		bitmap.fill(rgb_t::black(), cliprect);
+		return 0;
+	}
+
 	u32 base = m_dino[DINO_VIDEO_HIGH_BUFFER] & 0xffff'fff0;
 	if (base > (0x0040'0000 - FRAME_BYTES))
 		base = FALLBACK_BASE;
@@ -1622,12 +1644,14 @@ u16 datarover_state::main_battery_reading() const
 	// reports 100%.  "Low" sits under the 320-count warning threshold but
 	// above empty; "empty" is below the 80-count floor, which is what the OS
 	// treats as a flat cell.
+	u16 base;
 	switch (BIT(m_battery->read(), 0, 2))
 	{
-	case 1:  return 200;   // between empty (80) and the 320 warning point
-	case 2:  return 60;    // below empty
-	default: return 800;   // the record's full point, so the OS reports 100%
+	case 1:  base = 200; break; // between empty (80) and the 320 warning point
+	case 2:  base = 60; break;  // below empty
+	default: base = 800; break; // the record's full point, so the OS reports 100%
 	}
+	return std::min<u16>(base + m_main_battery_charge, 800);
 }
 
 
@@ -1788,6 +1812,14 @@ INPUT_CHANGED_MEMBER(datarover_state::phone_line_changed)
 }
 
 
+INPUT_CHANGED_MEMBER(datarover_state::main_battery_changed)
+{
+	// A machine-configuration change chooses a new synthetic starting charge.
+	// From there the charger model advances it over emulated time.
+	m_main_battery_charge = 0;
+}
+
+
 INPUT_CHANGED_MEMBER(datarover_state::battery_cover_changed)
 {
 	// Removing the cover is the positive edge on IO interrupt 2; refitting it
@@ -1870,6 +1902,21 @@ bool datarover_state::sound_dma_running() const
 	return BIT(m_dino[DINO_SIB_CONTROL], 0)
 			&& BIT(m_dino[DINO_SIB_CONTROL], 4)
 			&& (m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN);
+}
+
+
+bool datarover_state::magicbus_powered() const
+{
+	return !(m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_MBUS_VCC_OFF);
+}
+
+
+bool datarover_state::main_battery_charging() const
+{
+	return BIT(m_power_supply->read(), 0)
+			&& !BIT(m_power_supply->read(), 1)
+			&& (m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_CHARGER_ENABLE)
+			&& main_battery_reading() < 800;
 }
 
 
@@ -2180,6 +2227,9 @@ TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 
 void datarover_state::magicbus_set_request(bool asserted)
 {
+	if (asserted && !magicbus_powered())
+		asserted = false;
+
 	if (m_magicbus_request == asserted)
 		return;
 
@@ -2203,7 +2253,7 @@ TIMER_CALLBACK_MEMBER(datarover_state::magicbus_keyboard_tick)
 		// commands sent by the Magic Bus keyboard client produce 0xfa
 		// acknowledgements.  Those are controller protocol bytes, not Set-2
 		// key transitions, and the Magic Cap client only accepts the latter.
-		if (data == 0xaa || data == 0xfa)
+		if (!magicbus_powered() || data == 0xaa || data == 0xfa)
 			continue;
 
 		if (m_magicbus_key_count < m_magicbus_key_data.size())
@@ -2221,8 +2271,28 @@ TIMER_CALLBACK_MEMBER(datarover_state::magicbus_keyboard_tick)
 }
 
 
+TIMER_CALLBACK_MEMBER(datarover_state::battery_charge_tick)
+{
+	// The input-port choices are calibrated test levels, not a chemistry
+	// simulation.  Four ADC counts per emulated second makes the gradual rise
+	// observable in the Power window and deterministic in regressions while
+	// preserving the ROM's real 80/320/800 thresholds.
+	if (main_battery_charging())
+		++m_main_battery_charge;
+}
+
+
 void datarover_state::magicbus_command(u16 command)
 {
+	if (!magicbus_powered())
+	{
+		m_magicbus_response = MBUS_RESPONSE_NONE;
+		m_magicbus_keyboard_read_pending = false;
+		m_magicbus_host_data_pending = false;
+		magicbus_set_request(false);
+		return;
+	}
+
 	// Wire command words are the SDK's command-table entry XORed with the
 	// peripheral address code.  This model presents one AT keyboard at
 	// address zero; address seven is the broadcast address.
@@ -2295,6 +2365,12 @@ void datarover_state::magicbus_command(u16 command)
 
 void datarover_state::magicbus_deliver_response()
 {
+	if (!magicbus_powered())
+	{
+		m_magicbus_response = MBUS_RESPONSE_NONE;
+		return;
+	}
+
 	std::array<u8, 88> response{};
 	unsigned response_size = 0;
 
@@ -2411,7 +2487,8 @@ void datarover_state::magicbus_deliver_response()
 
 void datarover_state::magicbus_accept_host_data()
 {
-	if (!m_magicbus_host_data_pending
+	if (!magicbus_powered()
+			|| !m_magicbus_host_data_pending
 			|| !BIT(m_dino[DINO_MBUS_CONTROL1], 15))
 		return;
 
@@ -2673,6 +2750,27 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		update_periodic_timer();
 		break;
 
+	case DINO_MFIO_DATA_OUTPUT:
+	{
+		u32 const old_output = m_dino[offset];
+		COMBINE_DATA(&m_dino[offset]);
+		if (!(old_output & DINO_MFIO_MBUS_VCC_OFF)
+				&& (m_dino[offset] & DINO_MFIO_MBUS_VCC_OFF))
+		{
+			// Removing accessory power loses its address and pending
+			// transaction.  A later broadcast FIND discovers it afresh.
+			m_magicbus_assigned = false;
+			m_magicbus_info_page = 0;
+			m_magicbus_response = MBUS_RESPONSE_NONE;
+			m_magicbus_keyboard_read_pending = false;
+			m_magicbus_host_data_pending = false;
+			m_magicbus_key_head = 0;
+			m_magicbus_key_count = 0;
+			magicbus_set_request(false);
+		}
+		break;
+	}
+
 	case DINO_ALARM_HIGH:
 	case DINO_ALARM_LOW:
 		COMBINE_DATA(&m_dino[offset]);
@@ -2837,6 +2935,8 @@ void datarover_state::machine_start()
 	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
 	m_magicbus_keyboard_timer =
 			timer_alloc(FUNC(datarover_state::magicbus_keyboard_tick), this);
+	m_battery_charge_timer =
+			timer_alloc(FUNC(datarover_state::battery_charge_tick), this);
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
@@ -2870,6 +2970,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_magicbus_key_data));
 	save_item(NAME(m_magicbus_key_head));
 	save_item(NAME(m_magicbus_key_count));
+	save_item(NAME(m_main_battery_charge));
 	machine().save().register_postload(
 			save_prepost_delegate(FUNC(datarover_state::restore_inputs), this));
 }
@@ -2922,6 +3023,8 @@ void datarover_state::machine_reset()
 	m_magicbus_key_count = 0;
 	m_magicbus_keyboard_timer->adjust(
 			attotime::from_msec(1), 0, attotime::from_hz(240));
+	m_battery_charge_timer->adjust(
+			attotime::from_msec(250), 0, attotime::from_msec(250));
 	m_dmadac->enable(0);
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
@@ -3017,6 +3120,7 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x00, "Full")
 	PORT_CONFSETTING(0x01, "Low")
 	PORT_CONFSETTING(0x02, "Empty")
+	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::main_battery_changed), 0)
 	PORT_CONFNAME(0x0c, 0x00, "Backup battery")
 	PORT_CONFSETTING(0x00, "Good")
 	PORT_CONFSETTING(0x04, "Low")
