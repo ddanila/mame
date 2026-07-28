@@ -572,9 +572,11 @@ private:
 	static constexpr u32 CARD_SIZE = 8 * 1024 * 1024;
 	void set_present(bool present);
 	void flush();
+	bool has_storage_header() const;
 
 	std::vector<u8> m_data;
 	bool m_dirty = false;
+	bool m_magic_cap_storage = false;
 };
 
 DEFINE_DEVICE_TYPE(
@@ -599,6 +601,7 @@ void datarover_linear_pccard_device::device_start()
 {
 	save_item(NAME(m_data));
 	save_item(NAME(m_dirty));
+	save_item(NAME(m_magic_cap_storage));
 	set_present(exists());
 }
 
@@ -621,6 +624,9 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 	if (fread(m_data.data(), m_data.size()) != m_data.size())
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to read card image");
 
+	m_magic_cap_storage =
+			std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
+			|| has_storage_header();
 	m_dirty = false;
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
@@ -634,6 +640,7 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 	(void)format_options;
 
 	std::fill(m_data.begin(), m_data.end(), 0xff);
+	m_magic_cap_storage = true;
 	if (fwrite(m_data.data(), m_data.size()) != m_data.size())
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to create card image");
 
@@ -656,7 +663,14 @@ void datarover_linear_pccard_device::call_unload()
 {
 	flush();
 	std::fill(m_data.begin(), m_data.end(), 0xff);
+	m_magic_cap_storage = false;
 	set_present(false);
+}
+
+bool datarover_linear_pccard_device::has_storage_header() const
+{
+	return m_data.size() >= 0x5c
+			&& std::equal(m_data.begin() + 0x58, m_data.begin() + 0x5c, "MCAP");
 }
 
 u16 datarover_linear_pccard_device::read_memory(offs_t offset, u16 mem_mask)
@@ -688,10 +702,11 @@ void datarover_linear_pccard_device::write_memory(offs_t offset, u16 data, u16 m
 
 u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 {
-	// A small standards-compliant CIS is supplied separately from the raw
-	// common-memory image, just as it is on a physical linear memory card.
-	static constexpr std::array<u8, 42> CIS{
-			// CISTPL_DEVICE: SRAM, 250 ns, 16 units of 512 KiB = 8 MiB.
+	// Raw images that are neither erased nor Magic Cap volumes retain the
+	// generic SRAM identity used by the low-level PC Card probe and ROM
+	// flasher.  Magic Cap deliberately refuses to overwrite such a valid,
+	// unknown card.
+	static constexpr std::array<u8, 42> GENERIC_CIS{
 			0x01, 0x03, 0x61, 0x7d, 0xff,
 			0x15, 0x1e, 0x04, 0x01,
 			'G', 'e', 'n', 'e', 'r', 'a', 'l', ' ', 'M', 'a', 'g', 'i', 'c', 0x00,
@@ -699,7 +714,34 @@ u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 			0x21, 0x02, 0x01, 0x00,
 			0xff };
 
-	u8 const value = (offset < CIS.size()) ? CIS[offset] : 0xff;
+	// General Magic CISTPL_GM is supplied separately from common memory,
+	// just as it is on a physical Magic Cap storage card.  A blank card
+	// must not also advertise a conventional valid SRAM CIS, or the OS
+	// correctly treats it as an unknown card that must not be erased.
+	std::array<u8, 35> magic_cap_cis{
+			// Blank RAM card, with no common-memory metacluster yet.  The
+			// eight payload words are big-endian as documented by the Magic
+			// Cap PC Cards developer FAQ.
+			0xa0, 0x20,
+			'G', 'M', 'M', 'C',
+			0x00, 0x01, 0x00, 0x01,
+			'B', 'L', 'N', 'K',
+			0x00, 0x00, 0x00, 0x00,
+			'D', 'R', '8', '4',
+			0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00,
+			0xff };
+
+	if (has_storage_header())
+	{
+		std::copy_n("RAMC", 4, magic_cap_cis.begin() + 10);
+		std::copy_n(m_data.begin() + 0x60, 4, magic_cap_cis.begin() + 14);
+	}
+
+	u8 const value = m_magic_cap_storage
+			? ((offset < magic_cap_cis.size()) ? magic_cap_cis[offset] : 0xff)
+			: ((offset < GENERIC_CIS.size()) ? GENERIC_CIS[offset] : 0xff);
 	return (mem_mask & 0x00ff) ? (0xff00 | value) : 0xffff;
 }
 
@@ -985,6 +1027,7 @@ private:
 	std::array<bool, 2> m_pccard_cd1{ true, true };
 	std::array<bool, 2> m_pccard_cd2{ true, true };
 	std::array<bool, 2> m_pccard_ready{ true, true };
+	std::array<bool, 2> m_pccard_bvd1{ true, true };
 	std::array<bool, 2> m_pccard_bvd2{ true, true };
 	std::array<bool, 2> m_pccard_wp{};
 	std::array<u32, 5> m_rtc_nvram_data{};
@@ -1245,10 +1288,10 @@ void datarover_state::pccard_cd2_w(int state)
 template <unsigned Slot>
 void datarover_state::pccard_bvd1_w(int state)
 {
-	// Apollo routes a memory card's BVD1 through its multi-function I/O
-	// ASIC, while the same PC Card pin becomes IREQ in I/O mode.  The latter
-	// is presented on Glacier's READY/IREQ input and is the path needed by
-	// the serial-modem card.
+	// Apollo routes a memory card's BVD1 through Dino IO bits 1/0.  In PC
+	// Card I/O mode the same physical pin becomes active-low IREQ, sampled
+	// on Glacier's READY/IREQ input by the serial-modem card path.
+	m_pccard_bvd1[Slot] = bool(state);
 	m_pccard_ready[Slot] = bool(state);
 	update_pccard_inputs(Slot);
 }
@@ -2382,10 +2425,13 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 		// Input bits are sampled independently of the writable GPIO fields.
 		// Holding Option during reset enters the IDT monitor; BOOT_MODE keeps
 		// that convenient configuration while OPTION_BUTTON models the live
-		// physical control used by Magic Cap.
-		return (m_dino[offset] & ~(0x0000'0008 | DINO_IO_COVER_OPEN))
+		// physical control used by Magic Cap.  Apollo also wires the two PC
+		// Card BVD1 pins here (slot 1 on bit 1, slot 2 on bit 0).
+		return (m_dino[offset] & ~(0x0000'000b | DINO_IO_COVER_OPEN))
 				| ((m_boot_mode->read() && !m_option_button->read()) ? 0x0000'0008 : 0)
-				| (BIT(m_power_supply->read(), 1) ? DINO_IO_COVER_OPEN : 0);
+				| (BIT(m_power_supply->read(), 1) ? DINO_IO_COVER_OPEN : 0)
+				| (m_pccard_bvd1[0] ? 0x0000'0002 : 0)
+				| (m_pccard_bvd1[1] ? 0x0000'0001 : 0);
 
 	case DINO_POWER_CONTROL:
 		// Power-good is a read-only status input.  Without it, the low-level
@@ -2728,6 +2774,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_uart_rx_count));
 	save_item(NAME(m_pccard_cd1));
 	save_item(NAME(m_pccard_cd2));
+	save_item(NAME(m_pccard_bvd1));
 	save_item(NAME(m_pccard_bvd2));
 	save_item(NAME(m_pccard_wp));
 	save_item(NAME(m_rtc_nvram_data));
