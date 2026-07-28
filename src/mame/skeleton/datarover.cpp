@@ -236,6 +236,7 @@ public:
 	virtual void write_memory(offs_t offset, u16 data, u16 mem_mask = ~0) override;
 	virtual void write_reg(offs_t offset, u16 data, u16 mem_mask = ~0) override;
 	void poll() { poll_pty(); }
+	void restore_state(bool reinsert);
 
 protected:
 	virtual void device_start() override ATTR_COLD;
@@ -244,7 +245,6 @@ protected:
 
 private:
 	void set_present(bool present);
-	void restore_state();
 	void poll_pty();
 	void update_irq();
 	u8 memory_byte_r(u32 address);
@@ -299,8 +299,6 @@ void datarover_modem_pccard_device::device_start()
 	save_item(NAME(m_mcr));
 	save_item(NAME(m_scratch));
 	save_item(NAME(m_tx_irq_pending));
-	machine().save().register_postload(save_prepost_delegate(
-			FUNC(datarover_modem_pccard_device::restore_state), this));
 }
 
 void datarover_modem_pccard_device::set_present(bool present)
@@ -312,15 +310,24 @@ void datarover_modem_pccard_device::set_present(bool present)
 	m_wp_cb(0);
 }
 
-void datarover_modem_pccard_device::restore_state()
+void datarover_modem_pccard_device::restore_state(bool reinsert)
 {
-	// The selected card remains physically inserted across a restore.  Re-drive
-	// its level outputs without creating a false remove/insert or IREQ pulse,
-	// then derive IREQ from the restored UART enables and receive queue.
-	m_cd1_cb(0);
-	m_cd2_cb(0);
-	m_bvd2_cb(1);
-	m_wp_cb(0);
+	if (reinsert)
+	{
+		// A state created without this optional device describes an empty slot.
+		// Selecting the modem for that launch is a real insertion.
+		set_present(false);
+		set_present(true);
+	}
+	else
+	{
+		// A state saved with this modem present must retain continuous card
+		// presence. Re-drive levels without a false remove/insert or IREQ pulse.
+		m_cd1_cb(0);
+		m_cd2_cb(0);
+		m_bvd2_cb(1);
+		m_wp_cb(0);
+	}
 	update_irq();
 }
 
@@ -1647,6 +1654,15 @@ void datarover_state::set_phone_line(bool connected, bool signal_edge)
 void datarover_state::restore_inputs()
 {
 	set_phone_line(bool(m_phone_line->read()), true);
+	for (unsigned slot = 0; slot < m_modem_card.size(); ++slot)
+	{
+		if (m_modem_card[slot])
+		{
+			bool const saved_empty =
+					m_pccard_cd1[slot] || m_pccard_cd2[slot];
+			m_modem_card[slot]->restore_state(saved_empty);
+		}
+	}
 }
 
 
