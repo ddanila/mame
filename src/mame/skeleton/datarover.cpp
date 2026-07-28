@@ -800,11 +800,12 @@ u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 
 namespace {
 
-class datarover_state : public driver_device
+class datarover_state : public driver_device, public device_sound_interface
 {
 public:
 	datarover_state(machine_config const &mconfig, device_type type, char const *tag)
 		: driver_device(mconfig, type, tag)
+		, device_sound_interface(mconfig, *this)
 		, m_maincpu(*this, "maincpu")
 		, m_screen(*this, "screen")
 		, m_terminal(*this, "terminal")
@@ -812,6 +813,7 @@ public:
 		, m_rs232(*this, "rs232%u", 1U)
 		, m_irda(*this, "irda")
 		, m_dmadac(*this, "speaker_dac")
+		, m_microphone(*this, "microphone")
 		, m_magicbus_keyboard(*this, "magicbus_keyboard")
 		, m_pccard(*this, "pccard%u", 1U)
 		, m_modem_card(*this, "pccard%u:modem", 1U)
@@ -832,6 +834,7 @@ public:
 		, m_phone_line(*this, "PHONE_LINE")
 		, m_magicbus_accessory(*this, "MAGICBUS_ACCESSORY")
 		, m_irda_carrier(*this, "IRDA_CARRIER")
+		, m_microphone_source(*this, "MICROPHONE_SOURCE")
 	{
 	}
 
@@ -849,6 +852,7 @@ public:
 protected:
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
+	virtual void sound_stream_update(sound_stream &stream) override;
 
 private:
 	static constexpr u32 DINO_UART_A_CONTROL1 = 0x0b0 / 4;
@@ -870,6 +874,7 @@ private:
 	static constexpr u32 DINO_SIB_SOUND_HOLD = 0x078 / 4;
 	static constexpr u32 DINO_SIB_CONTROL = 0x074 / 4;
 	static constexpr u32 DINO_SIB_SIZE = 0x060 / 4;
+	static constexpr u32 DINO_SIB_SOUND_RX_START = 0x064 / 4;
 	static constexpr u32 DINO_SIB_SOUND_TX_START = 0x068 / 4;
 	static constexpr u32 DINO_SIB_DMA = 0x090 / 4;
 
@@ -877,6 +882,7 @@ private:
 	static constexpr u32 SIB_SOUND_DMA_ONCE = 0x8000'0000; // kSibSoundDmaOnceMask
 	static constexpr u32 SIB_SOUND_DMA_LOOP = 0x4000'0000; // kSibSoundDmaLoopMask
 	static constexpr u32 SIB_SOUND_DMA_PTR = 0x3ffc'0000;  // kSibSoundDmaPtrMask
+	static constexpr u32 SIB_SOUND_RX_DMA_EN = 0x0002'0000; // kSibEnSoundRxDmaMask
 	static constexpr u32 SIB_SOUND_TX_DMA_EN = 0x0001'0000; // kSibEnSoundTxDmaMask
 	static constexpr unsigned SIB_SOUND_PTR_SHIFT = 18;    // kSibSoundDmaPtrShift
 
@@ -1040,6 +1046,7 @@ private:
 	void update_sib_timers();
 	bool sound_dma_running() const;
 	void advance_sound_dma();
+	s16 microphone_sample(double sample_rate);
 	bool telecom_dma_running() const;
 	void advance_telecom_dma();
 	void update_periodic_timer();
@@ -1064,6 +1071,7 @@ private:
 	required_device_array<rs232_port_device, 2> m_rs232;
 	required_device<datarover_irda_device> m_irda;
 	required_device<dmadac_sound_device> m_dmadac;
+	required_device<microphone_device> m_microphone;
 	required_device<at_keyboard_device> m_magicbus_keyboard;
 	required_device_array<pccard_slot_device, 2> m_pccard;
 	optional_device_array<datarover_modem_pccard_device, 2> m_modem_card;
@@ -1084,6 +1092,7 @@ private:
 	required_ioport m_phone_line;
 	required_ioport m_magicbus_accessory;
 	required_ioport m_irda_carrier;
+	required_ioport m_microphone_source;
 
 	std::array<u32, 0x200 / 4> m_dino{};
 	std::array<u32, 0x24 / 4> m_glacier1{};
@@ -1109,6 +1118,12 @@ private:
 	emu_timer *m_rtc_persist_timer = nullptr;
 	emu_timer *m_sib_timer = nullptr;
 	bool m_sound_dma_half_signalled = false;
+	static constexpr u32 MICROPHONE_QUEUE_SIZE = 65'536;
+	std::array<s16, MICROPHONE_QUEUE_SIZE> m_microphone_data{};
+	u32 m_microphone_head = 0;
+	u32 m_microphone_count = 0;
+	u32 m_microphone_phase = 0;
+	sound_stream *m_microphone_stream = nullptr;
 	bool m_telecom_dma_half_signalled = false;
 	u32 m_telecom_loopback = 0;
 	bool m_magicbus_request = false;
@@ -1925,11 +1940,11 @@ void datarover_state::update_irq()
 bool datarover_state::sound_dma_running() const
 {
 	// Sound DMA needs the SIB enabled, its sound channel enabled, and the
-	// transmit DMA enable the ROM sets last (SibCmdStartSoundOut ends with
-	// sibDMA |= kSibEnSoundTxDmaMask).
+	// direction enable the ROM sets last.
 	return BIT(m_dino[DINO_SIB_CONTROL], 0)
 			&& BIT(m_dino[DINO_SIB_CONTROL], 4)
-			&& (m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN);
+			&& (m_dino[DINO_SIB_DMA]
+					& (SIB_SOUND_RX_DMA_EN | SIB_SOUND_TX_DMA_EN));
 }
 
 
@@ -1955,13 +1970,28 @@ void datarover_state::advance_sound_dma()
 	u32 const words = ((m_dino[DINO_SIB_SIZE] & SIB_SOUND_SIZE) >> SIB_SOUND_PTR_SHIFT) + 1;
 	u32 ptr = (m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_PTR) >> SIB_SOUND_PTR_SHIFT;
 
-	// The ROM hands Dino a start address with the segment bits still set, so
-	// mask it to a physical DRAM address the way the SIB's bus master would.
-	u32 const base = m_dino[DINO_SIB_SOUND_TX_START] & 0x1fff'fffc;
-	u32 const word = m_maincpu->space(AS_PROGRAM).read_dword(base + ptr * 4);
-
-	if (BIT(m_betty[8], 15))
+	// The ROM hands Dino start addresses with the segment bits still set, so
+	// mask them to physical DRAM addresses the way the SIB bus master would.
+	if (m_dino[DINO_SIB_DMA] & SIB_SOUND_RX_DMA_EN)
 	{
+		if (!m_microphone_source->read())
+			m_microphone_stream->update();
+
+		unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 8, 7) + 1;
+		double const sample_rate = 9'216'000.0 / (32.0 * divisor);
+		u16 const first = u16(microphone_sample(sample_rate));
+		u16 const second = u16(microphone_sample(sample_rate));
+		u32 const word = (u32(first) << 16) | second;
+		u32 const base = m_dino[DINO_SIB_SOUND_RX_START] & 0x1fff'fffc;
+		m_maincpu->space(AS_PROGRAM).write_dword(base + ptr * 4, word);
+	}
+
+	if ((m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN)
+			&& BIT(m_betty[8], 15))
+	{
+		u32 const base = m_dino[DINO_SIB_SOUND_TX_START] & 0x1fff'fffc;
+		u32 const word =
+				m_maincpu->space(AS_PROGRAM).read_dword(base + ptr * 4);
 		// One 32-bit slot carries two signed 16-bit samples, most significant
 		// first, matching the unbuffered hold register.
 		std::array<s16, 2> samples{ s16(word >> 16), s16(word) };
@@ -1988,7 +2018,8 @@ void datarover_state::advance_sound_dma()
 		// kSibSoundDmaLoopMask.  Only an explicitly requested one-shot transfer
 		// stops at the end.
 		if (m_dino[DINO_SIB_DMA] & SIB_SOUND_DMA_ONCE)
-			m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_TX_DMA_EN;
+			m_dino[DINO_SIB_DMA] &=
+					~(SIB_SOUND_RX_DMA_EN | SIB_SOUND_TX_DMA_EN);
 	}
 
 	// The pointer field is hardware-owned; SibServerSyncSoundOutDma reads it
@@ -1997,6 +2028,59 @@ void datarover_state::advance_sound_dma()
 			| ((ptr << SIB_SOUND_PTR_SHIFT) & SIB_SOUND_DMA_PTR);
 
 	update_irq();
+}
+
+
+s16 datarover_state::microphone_sample(double sample_rate)
+{
+	switch (m_microphone_source->read())
+	{
+	case 1:
+	{
+		// A stable full-scale-safe source for regression and sound-stamp demos.
+		static constexpr double TWO_PI = 6.28318530717958647692;
+		double const angle =
+				double(m_microphone_phase) * (TWO_PI / 4'294'967'296.0);
+		s16 const sample = s16(std::lround(std::sin(angle) * 12'000.0));
+		u32 const step = u32(std::lround(
+				(1'000.0 * 4'294'967'296.0) / sample_rate));
+		m_microphone_phase += step;
+		return sample;
+	}
+
+	case 2:
+		return 0;
+
+	default:
+		if (m_microphone_count)
+		{
+			s16 const sample = m_microphone_data[m_microphone_head];
+			m_microphone_head =
+					(m_microphone_head + 1) % MICROPHONE_QUEUE_SIZE;
+			--m_microphone_count;
+			return sample;
+		}
+		return 0;
+	}
+}
+
+
+void datarover_state::sound_stream_update(sound_stream &stream)
+{
+	for (int index = 0; index < stream.samples(); ++index)
+	{
+		s16 const sample = s16(std::lround(std::clamp(
+				stream.get(0, index), -1.0F, 1.0F) * 32'767.0F));
+		if (m_microphone_count == MICROPHONE_QUEUE_SIZE)
+			m_microphone_head =
+					(m_microphone_head + 1) % MICROPHONE_QUEUE_SIZE;
+		else
+			++m_microphone_count;
+		m_microphone_data[
+				(m_microphone_head + m_microphone_count - 1)
+				% MICROPHONE_QUEUE_SIZE] = sample;
+	}
+	stream.fill(0, 0.0F);
 }
 
 
@@ -2081,6 +2165,7 @@ void datarover_state::update_sib_timers()
 		double const sample_rate = 9'216'000.0 / (32.0 * divisor);
 		attotime const interval = attotime::from_hz(sample_rate / 2.0);
 		m_dmadac->set_frequency(sample_rate);
+		m_microphone_stream->set_sample_rate(sample_rate);
 		m_sound_timer->adjust(interval, 0, interval);
 	}
 	else
@@ -2686,18 +2771,24 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		// The pointer field is written back by hardware, so a write keeps the
 		// current position rather than taking one from the CPU.
 		u32 const preserved = m_dino[offset] & (SIB_SOUND_DMA_PTR | SIB_TEL_DMA_PTR);
-		bool const was_running = bool(m_dino[offset] & SIB_SOUND_TX_DMA_EN);
+		bool const was_running = bool(m_dino[offset]
+				& (SIB_SOUND_RX_DMA_EN | SIB_SOUND_TX_DMA_EN));
 		bool const was_tel_running =
 				bool(m_dino[offset] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN));
 		COMBINE_DATA(&m_dino[offset]);
 		m_dino[offset] = (m_dino[offset] & ~(SIB_SOUND_DMA_PTR | SIB_TEL_DMA_PTR))
 				| preserved;
 
-		if (!was_running && (m_dino[offset] & SIB_SOUND_TX_DMA_EN))
+		if (!was_running
+				&& (m_dino[offset]
+						& (SIB_SOUND_RX_DMA_EN | SIB_SOUND_TX_DMA_EN)))
 		{
 			// A fresh transfer starts at the beginning of the buffer.
 			m_dino[offset] &= ~SIB_SOUND_DMA_PTR;
 			m_sound_dma_half_signalled = false;
+			m_microphone_head = 0;
+			m_microphone_count = 0;
+			m_microphone_phase = 0;
 			m_dmadac->flush();
 		}
 
@@ -2968,6 +3059,9 @@ void datarover_state::machine_start()
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
 	m_dmadac->set_frequency(11'025);
 	m_dmadac->enable(1);
+	// Keep one un-routed output so MAME can safely resample this input stream
+	// when Magic Cap selects a different recording rate.
+	m_microphone_stream = stream_alloc(1, 1, 11'025);
 
 	save_item(NAME(m_dino));
 	save_item(NAME(m_glacier1));
@@ -2988,6 +3082,10 @@ void datarover_state::machine_start()
 	save_item(NAME(m_rtc_base));
 	save_item(NAME(m_rtc_origin));
 	save_item(NAME(m_sound_dma_half_signalled));
+	save_item(NAME(m_microphone_data));
+	save_item(NAME(m_microphone_head));
+	save_item(NAME(m_microphone_count));
+	save_item(NAME(m_microphone_phase));
 	save_item(NAME(m_telecom_dma_half_signalled));
 	save_item(NAME(m_telecom_loopback));
 	save_item(NAME(m_magicbus_request));
@@ -3039,6 +3137,11 @@ void datarover_state::machine_reset()
 	m_rtc_persist_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
 	m_sib_timer->reset();
 	m_sound_timer->reset();
+	m_sound_dma_half_signalled = false;
+	m_microphone_data.fill(0);
+	m_microphone_head = 0;
+	m_microphone_count = 0;
+	m_microphone_phase = 0;
 	m_telecom_timer->reset();
 	m_telecom_dma_half_signalled = false;
 	m_telecom_loopback = 0;
@@ -3182,6 +3285,12 @@ static INPUT_PORTS_START(datarover840)
 		PORT_NAME("IrDA carrier")
 		PORT_CHANGED_MEMBER(
 				DEVICE_SELF, FUNC(datarover_state::irda_carrier_changed), 0)
+
+	PORT_START("MICROPHONE_SOURCE")
+	PORT_CONFNAME(0x03, 0x00, "Microphone source")
+	PORT_CONFSETTING(0x00, "Host microphone")
+	PORT_CONFSETTING(0x01, "1 kHz test tone")
+	PORT_CONFSETTING(0x02, "Silence")
 INPUT_PORTS_END
 
 
@@ -3266,6 +3375,8 @@ void datarover_state::datarover840(machine_config &config)
 
 	SPEAKER(config, "speaker").front_center();
 	DMADAC(config, m_dmadac).add_route(ALL_OUTPUTS, "speaker", 0.5);
+	MICROPHONE(config, m_microphone, 1).front_center();
+	m_microphone->add_route(0, *this, 1.0, 0);
 }
 
 
