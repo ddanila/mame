@@ -2230,7 +2230,11 @@ void datarover_state::magicbus_command(u16 command)
 	switch (command)
 	{
 	case 0xdef0: // command 31, broadcast: assign an address
-		if (BIT(m_magicbus_accessory->read(), 0) && !m_magicbus_assigned)
+		// The ROM also starts reinitialization with this broadcast.  Its
+		// current client is discarded before the sole attached keyboard is
+		// assigned address zero again, so the peripheral must answer even
+		// when this machine process has seen an earlier assignment.
+		if (BIT(m_magicbus_accessory->read(), 0))
 			magicbus_set_request(true);
 		break;
 
