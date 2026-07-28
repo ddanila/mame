@@ -570,13 +570,17 @@ protected:
 
 private:
 	static constexpr u32 CARD_SIZE = 8 * 1024 * 1024;
+	static constexpr u32 LEGACY_FILE_HEADER_SIZE = 0x70;
+	static constexpr u32 LEGACY_CIS_OFFSET = 0x0c;
 	void set_present(bool present);
 	void flush();
 	bool has_storage_header() const;
+	bool has_legacy_storage_header() const;
 
 	std::vector<u8> m_data;
 	bool m_dirty = false;
 	bool m_magic_cap_storage = false;
+	bool m_legacy_storage = false;
 };
 
 DEFINE_DEVICE_TYPE(
@@ -602,6 +606,7 @@ void datarover_linear_pccard_device::device_start()
 	save_item(NAME(m_data));
 	save_item(NAME(m_dirty));
 	save_item(NAME(m_magic_cap_storage));
+	save_item(NAME(m_legacy_storage));
 	set_present(exists());
 }
 
@@ -624,9 +629,11 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 	if (fread(m_data.data(), m_data.size()) != m_data.size())
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to read card image");
 
+	m_legacy_storage = has_legacy_storage_header();
 	m_magic_cap_storage =
 			std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
-			|| has_storage_header();
+			|| has_storage_header()
+			|| m_legacy_storage;
 	m_dirty = false;
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
@@ -641,6 +648,7 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 
 	std::fill(m_data.begin(), m_data.end(), 0xff);
 	m_magic_cap_storage = true;
+	m_legacy_storage = false;
 	if (fwrite(m_data.data(), m_data.size()) != m_data.size())
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to create card image");
 
@@ -664,6 +672,7 @@ void datarover_linear_pccard_device::call_unload()
 	flush();
 	std::fill(m_data.begin(), m_data.end(), 0xff);
 	m_magic_cap_storage = false;
+	m_legacy_storage = false;
 	set_present(false);
 }
 
@@ -673,9 +682,26 @@ bool datarover_linear_pccard_device::has_storage_header() const
 			&& std::equal(m_data.begin() + 0x58, m_data.begin() + 0x5c, "MCAP");
 }
 
+bool datarover_linear_pccard_device::has_legacy_storage_header() const
+{
+	// Magic Cap Simulator 1.x GMCD/MCAP files keep their Macintosh-facing
+	// CIS at the beginning of the image.  tools/legacy_card_image.py merges
+	// the optional changes file and pads that representation to 8 MiB.
+	static constexpr std::array<u8, 6> LEGACY_GM_TUPLE{
+			0xa0, 0x20, 'G', 'M', 'M', 'C' };
+	return m_data.size() >= 0x23
+			&& std::equal(
+					LEGACY_GM_TUPLE.begin(),
+					LEGACY_GM_TUPLE.end(),
+					m_data.begin() + 0x1d);
+}
+
 u16 datarover_linear_pccard_device::read_memory(offs_t offset, u16 mem_mask)
 {
-	u32 const address = offset * 2;
+	// The Simulator's combined file stores attribute memory before common
+	// memory.  A physical card presents them as separate address spaces.
+	u32 const address = (offset * 2)
+			+ (m_legacy_storage ? LEGACY_FILE_HEADER_SIZE : 0);
 	u16 result = 0xffff;
 	if (address < m_data.size())
 	{
@@ -689,7 +715,8 @@ u16 datarover_linear_pccard_device::read_memory(offs_t offset, u16 mem_mask)
 
 void datarover_linear_pccard_device::write_memory(offs_t offset, u16 data, u16 mem_mask)
 {
-	u32 const address = offset * 2;
+	u32 const address = (offset * 2)
+			+ (m_legacy_storage ? LEGACY_FILE_HEADER_SIZE : 0);
 	if (is_readonly() || (address >= m_data.size()))
 		return;
 
@@ -739,7 +766,15 @@ u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 		std::copy_n(m_data.begin() + 0x60, 4, magic_cap_cis.begin() + 14);
 	}
 
-	u8 const value = m_magic_cap_storage
+	// A Simulator 1.x card keeps a 12-byte Macintosh wrapper before the
+	// authentic tuple stream.  Expose the CIS that follows it as attribute
+	// memory; common-memory accesses skip the whole prefix above, matching
+	// the two physical card spaces.
+	u8 const value = m_legacy_storage
+			? (((offset + LEGACY_CIS_OFFSET) < LEGACY_FILE_HEADER_SIZE)
+					? m_data[offset + LEGACY_CIS_OFFSET]
+					: 0xff)
+			: m_magic_cap_storage
 			? ((offset < magic_cap_cis.size()) ? magic_cap_cis[offset] : 0xff)
 			: ((offset < GENERIC_CIS.size()) ? GENERIC_CIS[offset] : 0xff);
 	return (mem_mask & 0x00ff) ? (0xff00 | value) : 0xffff;
