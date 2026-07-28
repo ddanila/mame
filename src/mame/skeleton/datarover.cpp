@@ -772,6 +772,7 @@ public:
 		, m_battery(*this, "BATTERY")
 		, m_power_supply(*this, "POWER_SUPPLY")
 		, m_option_button(*this, "OPTION_BUTTON")
+		, m_pccard_battery(*this, "PCCARD%u_BATTERY", 1U)
 		, m_touch_x(*this, "TOUCH_X")
 		, m_touch_y(*this, "TOUCH_Y")
 		, m_touch_button(*this, "TOUCH_BUTTON")
@@ -786,6 +787,7 @@ public:
 	void datarover840f(machine_config &config);
 	INPUT_CHANGED_MEMBER(touch_changed);
 	INPUT_CHANGED_MEMBER(option_changed);
+	INPUT_CHANGED_MEMBER(pccard_battery_changed);
 	INPUT_CHANGED_MEMBER(power_changed);
 	INPUT_CHANGED_MEMBER(phone_line_changed);
 	INPUT_CHANGED_MEMBER(battery_cover_changed);
@@ -944,6 +946,8 @@ private:
 	template <unsigned Slot> void pccard_bvd1_w(int state);
 	template <unsigned Slot> void pccard_bvd2_w(int state);
 	template <unsigned Slot> void pccard_wp_w(int state);
+	bool pccard_bvd1_level(unsigned slot) const;
+	bool pccard_bvd2_level(unsigned slot) const;
 	void update_pccard_inputs(unsigned slot);
 	u32 glacier_r(unsigned slot, offs_t offset) const;
 	void glacier_w(unsigned slot, offs_t offset, u32 data, u32 mem_mask);
@@ -1007,6 +1011,7 @@ private:
 	required_ioport m_battery;
 	required_ioport m_power_supply;
 	required_ioport m_option_button;
+	required_ioport_array<2> m_pccard_battery;
 	required_ioport m_touch_x;
 	required_ioport m_touch_y;
 	required_ioport m_touch_button;
@@ -1242,7 +1247,7 @@ void datarover_state::update_pccard_inputs(unsigned slot)
 		value |= 0x0300; // five-volt card voltage-sense coding
 		if (m_pccard_ready[slot])
 			value |= 0x0004; // READY, or active-low IREQ in I/O mode
-		if (m_pccard_bvd2[slot])
+		if (pccard_bvd2_level(slot))
 			value |= 0x0002;
 		if (m_pccard_wp[slot])
 			value |= 0x0008;
@@ -1266,6 +1271,19 @@ void datarover_state::update_pccard_inputs(unsigned slot)
 		update_glacier_irq();
 		update_irq();
 	}
+}
+
+
+bool datarover_state::pccard_bvd1_level(unsigned slot) const
+{
+	unsigned const battery = m_pccard_battery[slot]->read();
+	return m_pccard_bvd1[slot] && (battery == 3 || battery == 1);
+}
+
+
+bool datarover_state::pccard_bvd2_level(unsigned slot) const
+{
+	return m_pccard_bvd2[slot] && m_pccard_battery[slot]->read() == 3;
 }
 
 
@@ -1664,6 +1682,28 @@ INPUT_CHANGED_MEMBER(datarover_state::option_changed)
 	// Dino samples the physical button as an active-low input on IO control
 	// bit 3.  Interrupt 5 presents separate falling- and rising-edge sources.
 	m_dino[DINO_INTERRUPT5] |= newval ? 0x0000'0008 : 0x0000'0400;
+	update_irq();
+}
+
+
+INPUT_CHANGED_MEMBER(datarover_state::pccard_battery_changed)
+{
+	unsigned const slot = unsigned(param);
+	auto const bvd1_for = [](u32 battery) {
+		return battery == 3 || battery == 1;
+	};
+	bool const old_bvd1 = m_pccard_bvd1[slot] && bvd1_for(oldval);
+	bool const new_bvd1 = m_pccard_bvd1[slot] && bvd1_for(newval);
+	if (old_bvd1 != new_bvd1)
+	{
+		// The BVD1 pins are Dino IO inputs 1/0, with corresponding
+		// positive- and negative-edge sources in interrupt bank 5.
+		if (new_bvd1)
+			m_dino[DINO_INTERRUPT5] |= slot ? 0x0000'0080 : 0x0000'0100;
+		else
+			m_dino[DINO_INTERRUPT5] |= slot ? 0x0000'0001 : 0x0000'0002;
+	}
+	update_pccard_inputs(slot);
 	update_irq();
 }
 
@@ -2430,8 +2470,8 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 		return (m_dino[offset] & ~(0x0000'000b | DINO_IO_COVER_OPEN))
 				| ((m_boot_mode->read() && !m_option_button->read()) ? 0x0000'0008 : 0)
 				| (BIT(m_power_supply->read(), 1) ? DINO_IO_COVER_OPEN : 0)
-				| (m_pccard_bvd1[0] ? 0x0000'0002 : 0)
-				| (m_pccard_bvd1[1] ? 0x0000'0001 : 0);
+				| (pccard_bvd1_level(0) ? 0x0000'0002 : 0)
+				| (pccard_bvd1_level(1) ? 0x0000'0001 : 0);
 
 	case DINO_POWER_CONTROL:
 		// Power-good is a read-only status input.  Without it, the low-level
@@ -2893,6 +2933,20 @@ static INPUT_PORTS_START(datarover840)
 
 	PORT_START("OPTION_BUTTON")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Option button") PORT_CODE(KEYCODE_LALT) PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::option_changed), 0)
+
+	PORT_START("PCCARD1_BATTERY")
+	PORT_CONFNAME(0x03, 0x03, "PC Card slot 1 battery")
+	PORT_CONFSETTING(0x03, "Good")
+	PORT_CONFSETTING(0x01, "Low")
+	PORT_CONFSETTING(0x02, "Dead")
+	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::pccard_battery_changed), 0)
+
+	PORT_START("PCCARD2_BATTERY")
+	PORT_CONFNAME(0x03, 0x03, "PC Card slot 2 battery")
+	PORT_CONFSETTING(0x03, "Good")
+	PORT_CONFSETTING(0x01, "Low")
+	PORT_CONFSETTING(0x02, "Dead")
+	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::pccard_battery_changed), 1)
 
 	PORT_START("TOUCH_X")
 	PORT_BIT(0xffff, 0x8000, IPT_LIGHTGUN_X) PORT_NAME("Pen X") PORT_MINMAX(0, 0xffff) PORT_SENSITIVITY(100) PORT_CODE(GUNCODE_X) PORT_CODE_DEC(INPUT_CODE_INVALID) PORT_CODE_INC(INPUT_CODE_INVALID) PORT_CROSSHAIR(X, 1.0, 0.0, 0)
