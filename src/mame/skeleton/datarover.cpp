@@ -570,7 +570,7 @@ protected:
 
 private:
 	static constexpr u32 CARD_SIZE = 8 * 1024 * 1024;
-	static constexpr u32 LEGACY_FILE_HEADER_SIZE = 0x70;
+	static constexpr u32 LEGACY_WRAPPER_SIZE = 0x70;
 	static constexpr u32 LEGACY_CIS_OFFSET = 0x0c;
 	void set_present(bool present);
 	void flush();
@@ -698,10 +698,11 @@ bool datarover_linear_pccard_device::has_legacy_storage_header() const
 
 u16 datarover_linear_pccard_device::read_memory(offs_t offset, u16 mem_mask)
 {
-	// The Simulator's combined file stores attribute memory before common
-	// memory.  A physical card presents them as separate address spaces.
-	u32 const address = (offset * 2)
-			+ (m_legacy_storage ? LEGACY_FILE_HEADER_SIZE : 0);
+	// A Simulator card's CISTPL_GM tuple advertises the metacluster's offset
+	// in the combined file (normally 0x70).  Keep that same layout in common
+	// memory: stripping the wrapper here would apply the offset twice and
+	// make the 1.0 translator scan 0x70 bytes past the metacluster.
+	u32 const address = offset * 2;
 	u16 result = 0xffff;
 	if (address < m_data.size())
 	{
@@ -715,8 +716,7 @@ u16 datarover_linear_pccard_device::read_memory(offs_t offset, u16 mem_mask)
 
 void datarover_linear_pccard_device::write_memory(offs_t offset, u16 data, u16 mem_mask)
 {
-	u32 const address = (offset * 2)
-			+ (m_legacy_storage ? LEGACY_FILE_HEADER_SIZE : 0);
+	u32 const address = offset * 2;
 	if (is_readonly() || (address >= m_data.size()))
 		return;
 
@@ -768,10 +768,9 @@ u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 
 	// A Simulator 1.x card keeps a 12-byte Macintosh wrapper before the
 	// authentic tuple stream.  Expose the CIS that follows it as attribute
-	// memory; common-memory accesses skip the whole prefix above, matching
-	// the two physical card spaces.
+	// memory while retaining the combined offsets in common memory.
 	u8 const value = m_legacy_storage
-			? (((offset + LEGACY_CIS_OFFSET) < LEGACY_FILE_HEADER_SIZE)
+			? (((offset + LEGACY_CIS_OFFSET) < LEGACY_WRAPPER_SIZE)
 					? m_data[offset + LEGACY_CIS_OFFSET]
 					: 0xff)
 			: m_magic_cap_storage
