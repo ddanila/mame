@@ -244,7 +244,7 @@ protected:
 
 private:
 	void set_present(bool present);
-	void restore_presence();
+	void restore_state();
 	void poll_pty();
 	void update_irq();
 	u8 memory_byte_r(u32 address);
@@ -287,9 +287,20 @@ datarover_modem_pccard_device::datarover_modem_pccard_device(
 void datarover_modem_pccard_device::device_start()
 {
 	open();
-	set_present(true);
+
+	save_item(NAME(m_rx_data));
+	save_item(NAME(m_rx_head));
+	save_item(NAME(m_rx_count));
+	save_item(NAME(m_config_option));
+	save_item(NAME(m_ier));
+	save_item(NAME(m_divisor));
+	save_item(NAME(m_fcr));
+	save_item(NAME(m_lcr));
+	save_item(NAME(m_mcr));
+	save_item(NAME(m_scratch));
+	save_item(NAME(m_tx_irq_pending));
 	machine().save().register_postload(save_prepost_delegate(
-			FUNC(datarover_modem_pccard_device::restore_presence), this));
+			FUNC(datarover_modem_pccard_device::restore_state), this));
 }
 
 void datarover_modem_pccard_device::set_present(bool present)
@@ -301,16 +312,16 @@ void datarover_modem_pccard_device::set_present(bool present)
 	m_wp_cb(0);
 }
 
-void datarover_modem_pccard_device::restore_presence()
+void datarover_modem_pccard_device::restore_state()
 {
-	// Save states created without this optional card describe an empty slot.
-	// Selecting the modem device itself means it is physically inserted, so
-	// pulse the card-detect pins after the rest of the machine state loads.
-	// The edge is also required when the state itself was saved with a modem:
-	// otherwise the restored high-level actor keeps its stale pre-save card
-	// session and does not re-enumerate the new host PTY.
-	set_present(false);
-	set_present(true);
+	// The selected card remains physically inserted across a restore.  Re-drive
+	// its level outputs without creating a false remove/insert or IREQ pulse,
+	// then derive IREQ from the restored UART enables and receive queue.
+	m_cd1_cb(0);
+	m_cd2_cb(0);
+	m_bvd2_cb(1);
+	m_wp_cb(0);
+	update_irq();
 }
 
 void datarover_modem_pccard_device::device_stop()
@@ -331,6 +342,7 @@ void datarover_modem_pccard_device::device_reset()
 	m_mcr = 0;
 	m_scratch = 0;
 	m_tx_irq_pending = false;
+	set_present(true);
 	update_irq();
 }
 
@@ -2952,6 +2964,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_uart_rx_count));
 	save_item(NAME(m_pccard_cd1));
 	save_item(NAME(m_pccard_cd2));
+	save_item(NAME(m_pccard_ready));
 	save_item(NAME(m_pccard_bvd1));
 	save_item(NAME(m_pccard_bvd2));
 	save_item(NAME(m_pccard_wp));
