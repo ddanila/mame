@@ -49,6 +49,8 @@
 #include "datarover840.lh"
 
 #include <array>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 
@@ -1156,11 +1158,12 @@ private:
 	char m_telephone_dtmf_last = 0;
 	bool m_telephone_dial_tone = false;
 	static constexpr unsigned TELEPHONE_BRIDGE_QUEUE_SIZE = 8'192;
-	static constexpr unsigned TELEPHONE_BRIDGE_PREBUFFER = 4'096;
+	static constexpr unsigned TELEPHONE_BRIDGE_PREBUFFER = 4;
 	std::array<u8, TELEPHONE_BRIDGE_QUEUE_SIZE> m_telephone_bridge_rx{};
 	u16 m_telephone_bridge_rx_head = 0;
 	u16 m_telephone_bridge_rx_count = 0;
 	bool m_telephone_bridge_rx_started = false;
+	u8 m_telephone_bridge_rx_misses = 0;
 	u8 m_telephone_pulse_count = 0;
 	u64 m_telephone_pulse_break_start = 0;
 	bool m_telephone_pulse_break = false;
@@ -2389,18 +2392,37 @@ u32 datarover_state::telephone_bridge_receive()
 	// Pull more than one word so a process that briefly falls behind can
 	// refill its queue instead of preserving a permanent stream offset.
 	std::array<u8, 1'024> input;
-	unsigned const count = m_phone_bridge->input(input.data(), input.size());
-	for (unsigned index = 0; index < count; ++index)
+	auto const deadline =
+			std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+	do
 	{
-		if (m_telephone_bridge_rx_count == m_telephone_bridge_rx.size())
+		// Keep socket reads large enough to bypass core_file read-ahead. The
+		// bitbanger's input and output share a file cursor, so interleaved
+		// output would otherwise skip bytes retained in the read buffer.
+		unsigned const count =
+				m_phone_bridge->input(input.data(), input.size());
+		for (unsigned index = 0; index < count; ++index)
+		{
+			if (m_telephone_bridge_rx_count == m_telephone_bridge_rx.size())
+				break;
+			m_telephone_bridge_rx[
+					(m_telephone_bridge_rx_head
+							+ m_telephone_bridge_rx_count)
+					% m_telephone_bridge_rx.size()] = input[index];
+			++m_telephone_bridge_rx_count;
+		}
+
+		if (!m_telephone_bridge_rx_started
+				|| m_telephone_bridge_rx_count >= 4
+				|| std::chrono::steady_clock::now() >= deadline)
 			break;
-		m_telephone_bridge_rx[
-				(m_telephone_bridge_rx_head + m_telephone_bridge_rx_count)
-				% m_telephone_bridge_rx.size()] = input[index];
-		++m_telephone_bridge_rx_count;
-	}
-	// Buffer about 284 ms before starting. The two emulators share nominal
-	// sample clocks but their host schedulers are independent.
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	} while (true);
+
+	// Keep a small startup cushion, then wait briefly for each word so
+	// independent host schedulers cannot make one virtual modem outrun the
+	// other and consume silence. Repeated timeouts return to nonblocking
+	// prebuffering, keeping a disconnected bridge from hanging the machine.
 	if (!m_telephone_bridge_rx_started)
 	{
 		if (m_telephone_bridge_rx_count < TELEPHONE_BRIDGE_PREBUFFER)
@@ -2408,7 +2430,15 @@ u32 datarover_state::telephone_bridge_receive()
 		m_telephone_bridge_rx_started = true;
 	}
 	if (m_telephone_bridge_rx_count < 4)
+	{
+		if (++m_telephone_bridge_rx_misses >= 4)
+		{
+			m_telephone_bridge_rx_misses = 0;
+			m_telephone_bridge_rx_started = false;
+		}
 		return 0;
+	}
+	m_telephone_bridge_rx_misses = 0;
 
 	u32 samples = 0;
 	for (unsigned index = 0; index < 4; ++index)
@@ -3441,6 +3471,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telephone_bridge_rx_head));
 	save_item(NAME(m_telephone_bridge_rx_count));
 	save_item(NAME(m_telephone_bridge_rx_started));
+	save_item(NAME(m_telephone_bridge_rx_misses));
 	save_item(NAME(m_telephone_pulse_count));
 	save_item(NAME(m_telephone_pulse_break_start));
 	save_item(NAME(m_telephone_pulse_break));
@@ -3512,6 +3543,7 @@ void datarover_state::machine_reset()
 	m_telephone_bridge_rx_head = 0;
 	m_telephone_bridge_rx_count = 0;
 	m_telephone_bridge_rx_started = false;
+	m_telephone_bridge_rx_misses = 0;
 	m_telephone_dial_tone = false;
 	m_telephone_pulse_count = 0;
 	m_telephone_pulse_break_start = 0;
