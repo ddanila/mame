@@ -2236,18 +2236,17 @@ void datarover_state::advance_telecom_dma()
 	{
 		u32 const base = m_dino[DINO_SIB_TEL_TX_START] & 0x1fff'fffc;
 		m_telecom_loopback = space.read_dword(base + ptr * 4);
-		if (m_phone_peer->read() == 1
-				&& BIT(m_betty[0], 8)
-				&& BIT(m_betty[0], 9))
+		unsigned const phone_peer = m_phone_peer->read();
+		bool const line_active =
+				BIT(m_betty[0], 8) && BIT(m_betty[0], 9);
+		if (BIT(phone_peer, 0) && line_active)
 		{
 			unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
 			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
 			telephone_transmit_sample(s16(m_telecom_loopback >> 16), sample_rate);
 			telephone_transmit_sample(s16(m_telecom_loopback), sample_rate);
 		}
-		else if (m_phone_peer->read() == 2
-				&& BIT(m_betty[0], 8)
-				&& BIT(m_betty[0], 9))
+		if (BIT(phone_peer, 1) && line_active)
 		{
 			telephone_bridge_transmit(m_telecom_loopback);
 		}
@@ -2262,22 +2261,24 @@ void datarover_state::advance_telecom_dma()
 		{
 			received = m_telecom_loopback;
 		}
-		else if (m_phone_peer->read() == 2
-				&& BIT(m_betty[0], 8)
-				&& BIT(m_betty[0], 9))
+		else if (BIT(m_betty[0], 8) && BIT(m_betty[0], 9))
 		{
-			received = telephone_bridge_receive();
-		}
-		else if (m_phone_peer->read() == 1
-				&& BIT(m_betty[0], 8)
-				&& BIT(m_betty[0], 9)
-				&& m_telephone_dial_tone)
-		{
-			unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
-			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
-			u16 const first = u16(telephone_sample(sample_rate));
-			u16 const second = u16(telephone_sample(sample_rate));
-			received = (u32(first) << 16) | second;
+			unsigned const phone_peer = m_phone_peer->read();
+			if (BIT(phone_peer, 1))
+				received = telephone_bridge_receive();
+			if (BIT(phone_peer, 0) && m_telephone_dial_tone)
+			{
+				// A central office supplies dial tone before connecting the
+				// far-end audio.  This also gives bridge-backed product tests
+				// the same real dialing phase as the automatic exchange.
+				unsigned const divisor =
+						BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
+				double const sample_rate =
+						9'216'000.0 / (32.0 * divisor);
+				u16 const first = u16(telephone_sample(sample_rate));
+				u16 const second = u16(telephone_sample(sample_rate));
+				received = (u32(first) << 16) | second;
+			}
 		}
 		space.write_dword(base + ptr * 4, received);
 	}
@@ -3694,6 +3695,7 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x00, "Silent line")
 	PORT_CONFSETTING(0x01, "Automatic test exchange")
 	PORT_CONFSETTING(0x02, "External PCM bridge")
+	PORT_CONFSETTING(0x03, "External PCM bridge with test exchange")
 
 	// Resuming battery-backed state normally advances the RTC by the host
 	// wall-clock time that passed while the machine was off, which is what a
