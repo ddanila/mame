@@ -36,6 +36,7 @@
 #include "cpu/mips/mips1.h"
 #include "diserial.h"
 #include "dipty.h"
+#include "imagedev/bitbngr.h"
 #include "machine/intelfsh.h"
 #include "machine/nvram.h"
 #include "machine/pckeybrd.h"
@@ -814,6 +815,7 @@ public:
 		, m_irda(*this, "irda")
 		, m_dmadac(*this, "speaker_dac")
 		, m_microphone(*this, "microphone")
+		, m_phone_bridge(*this, "phone_bridge")
 		, m_magicbus_keyboard(*this, "magicbus_keyboard")
 		, m_pccard(*this, "pccard%u", 1U)
 		, m_modem_card(*this, "pccard%u:modem", 1U)
@@ -1061,6 +1063,8 @@ private:
 	s16 telephone_sample(double sample_rate);
 	void telephone_transmit_sample(s16 sample, double sample_rate);
 	void telephone_process_dtmf(double sample_rate);
+	void telephone_bridge_transmit(u32 samples);
+	u32 telephone_bridge_receive();
 	void telephone_hookswitch_changed(bool offhook);
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
@@ -1086,6 +1090,7 @@ private:
 	required_device<datarover_irda_device> m_irda;
 	required_device<dmadac_sound_device> m_dmadac;
 	required_device<microphone_device> m_microphone;
+	required_device<bitbanger_device> m_phone_bridge;
 	required_device<at_keyboard_device> m_magicbus_keyboard;
 	required_device_array<pccard_slot_device, 2> m_pccard;
 	optional_device_array<datarover_modem_pccard_device, 2> m_modem_card;
@@ -1150,6 +1155,12 @@ private:
 	u16 m_telephone_dtmf_count = 0;
 	char m_telephone_dtmf_last = 0;
 	bool m_telephone_dial_tone = false;
+	static constexpr unsigned TELEPHONE_BRIDGE_QUEUE_SIZE = 8'192;
+	static constexpr unsigned TELEPHONE_BRIDGE_PREBUFFER = 4'096;
+	std::array<u8, TELEPHONE_BRIDGE_QUEUE_SIZE> m_telephone_bridge_rx{};
+	u16 m_telephone_bridge_rx_head = 0;
+	u16 m_telephone_bridge_rx_count = 0;
+	bool m_telephone_bridge_rx_started = false;
 	u8 m_telephone_pulse_count = 0;
 	u64 m_telephone_pulse_break_start = 0;
 	bool m_telephone_pulse_break = false;
@@ -2183,7 +2194,7 @@ void datarover_state::advance_telecom_dma()
 	{
 		u32 const base = m_dino[DINO_SIB_TEL_TX_START] & 0x1fff'fffc;
 		m_telecom_loopback = space.read_dword(base + ptr * 4);
-		if (m_phone_peer->read()
+		if (m_phone_peer->read() == 1
 				&& BIT(m_betty[0], 8)
 				&& BIT(m_betty[0], 9))
 		{
@@ -2191,6 +2202,12 @@ void datarover_state::advance_telecom_dma()
 			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
 			telephone_transmit_sample(s16(m_telecom_loopback >> 16), sample_rate);
 			telephone_transmit_sample(s16(m_telecom_loopback), sample_rate);
+		}
+		else if (m_phone_peer->read() == 2
+				&& BIT(m_betty[0], 8)
+				&& BIT(m_betty[0], 9))
+		{
+			telephone_bridge_transmit(m_telecom_loopback);
 		}
 	}
 
@@ -2203,7 +2220,13 @@ void datarover_state::advance_telecom_dma()
 		{
 			received = m_telecom_loopback;
 		}
-		else if (m_phone_peer->read()
+		else if (m_phone_peer->read() == 2
+				&& BIT(m_betty[0], 8)
+				&& BIT(m_betty[0], 9))
+		{
+			received = telephone_bridge_receive();
+		}
+		else if (m_phone_peer->read() == 1
 				&& BIT(m_betty[0], 8)
 				&& BIT(m_betty[0], 9)
 				&& m_telephone_dial_tone)
@@ -2346,6 +2369,58 @@ void datarover_state::telephone_process_dtmf(double sample_rate)
 		m_telephone_dial_tone = false;
 	}
 	m_telephone_dtmf_last = digit;
+}
+
+
+void datarover_state::telephone_bridge_transmit(u32 samples)
+{
+	// The bridge stream uses two signed 16-bit big-endian samples per Dino
+	// telecom word. A relay can pair two independent MAME processes without
+	// interpreting or synthesizing either modem's waveform.
+	m_phone_bridge->output(samples >> 24);
+	m_phone_bridge->output(samples >> 16);
+	m_phone_bridge->output(samples >> 8);
+	m_phone_bridge->output(samples);
+}
+
+
+u32 datarover_state::telephone_bridge_receive()
+{
+	// Pull more than one word so a process that briefly falls behind can
+	// refill its queue instead of preserving a permanent stream offset.
+	std::array<u8, 1'024> input;
+	unsigned const count = m_phone_bridge->input(input.data(), input.size());
+	for (unsigned index = 0; index < count; ++index)
+	{
+		if (m_telephone_bridge_rx_count == m_telephone_bridge_rx.size())
+			break;
+		m_telephone_bridge_rx[
+				(m_telephone_bridge_rx_head + m_telephone_bridge_rx_count)
+				% m_telephone_bridge_rx.size()] = input[index];
+		++m_telephone_bridge_rx_count;
+	}
+	// Buffer about 284 ms before starting. The two emulators share nominal
+	// sample clocks but their host schedulers are independent.
+	if (!m_telephone_bridge_rx_started)
+	{
+		if (m_telephone_bridge_rx_count < TELEPHONE_BRIDGE_PREBUFFER)
+			return 0;
+		m_telephone_bridge_rx_started = true;
+	}
+	if (m_telephone_bridge_rx_count < 4)
+		return 0;
+
+	u32 samples = 0;
+	for (unsigned index = 0; index < 4; ++index)
+	{
+		samples = (samples << 8)
+				| m_telephone_bridge_rx[m_telephone_bridge_rx_head];
+		m_telephone_bridge_rx_head =
+				(m_telephone_bridge_rx_head + 1)
+				% m_telephone_bridge_rx.size();
+		--m_telephone_bridge_rx_count;
+	}
+	return samples;
 }
 
 
@@ -3362,6 +3437,10 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telephone_dtmf_count));
 	save_item(NAME(m_telephone_dtmf_last));
 	save_item(NAME(m_telephone_dial_tone));
+	save_item(NAME(m_telephone_bridge_rx));
+	save_item(NAME(m_telephone_bridge_rx_head));
+	save_item(NAME(m_telephone_bridge_rx_count));
+	save_item(NAME(m_telephone_bridge_rx_started));
 	save_item(NAME(m_telephone_pulse_count));
 	save_item(NAME(m_telephone_pulse_break_start));
 	save_item(NAME(m_telephone_pulse_break));
@@ -3429,6 +3508,10 @@ void datarover_state::machine_reset()
 	m_telephone_dtmf_samples.fill(0);
 	m_telephone_dtmf_count = 0;
 	m_telephone_dtmf_last = 0;
+	m_telephone_bridge_rx.fill(0);
+	m_telephone_bridge_rx_head = 0;
+	m_telephone_bridge_rx_count = 0;
+	m_telephone_bridge_rx_started = false;
 	m_telephone_dial_tone = false;
 	m_telephone_pulse_count = 0;
 	m_telephone_pulse_break_start = 0;
@@ -3531,9 +3614,10 @@ static INPUT_PORTS_START(datarover840)
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Incoming telephone ring") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::phone_ring_changed), 0)
 
 	PORT_START("PHONE_PEER")
-	PORT_CONFNAME(0x01, 0x01, "Telephone exchange")
+	PORT_CONFNAME(0x03, 0x01, "Telephone exchange")
 	PORT_CONFSETTING(0x00, "Silent line")
 	PORT_CONFSETTING(0x01, "Automatic test exchange")
+	PORT_CONFSETTING(0x02, "External PCM bridge")
 
 	// Resuming battery-backed state normally advances the RTC by the host
 	// wall-clock time that passed while the machine was off, which is what a
@@ -3673,6 +3757,7 @@ void datarover_state::datarover840(machine_config &config)
 	DMADAC(config, m_dmadac).add_route(ALL_OUTPUTS, "speaker", 0.5);
 	MICROPHONE(config, m_microphone, 1).front_center();
 	m_microphone->add_route(0, *this, 1.0, 0);
+	BITBANGER(config, m_phone_bridge).set_interface("datarover_phone");
 }
 
 
