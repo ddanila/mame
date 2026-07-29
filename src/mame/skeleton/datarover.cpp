@@ -1037,6 +1037,7 @@ private:
 	void update_betty_irq();
 	void set_phone_line(bool connected, bool signal_edge);
 	void set_phone_ring(bool ringing, bool signal_edge);
+	void update_phone_ring_input(bool ringing, bool signal_edge);
 	void restore_inputs();
 	u16 touch_adc_value() const;
 	u16 main_battery_reading() const;
@@ -1079,6 +1080,7 @@ private:
 	TIMER_CALLBACK_MEMBER(sib_tick);
 	TIMER_CALLBACK_MEMBER(telecom_tick);
 	TIMER_CALLBACK_MEMBER(telephone_pulse_digit);
+	TIMER_CALLBACK_MEMBER(phone_ring_tick);
 	TIMER_CALLBACK_MEMBER(sound_tick);
 	TIMER_CALLBACK_MEMBER(magicbus_keyboard_tick);
 	TIMER_CALLBACK_MEMBER(battery_charge_tick);
@@ -1187,6 +1189,7 @@ private:
 	u16 m_main_battery_charge = 0;
 	emu_timer *m_telecom_timer = nullptr;
 	emu_timer *m_telephone_pulse_timer = nullptr;
+	emu_timer *m_phone_ring_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
 	emu_timer *m_magicbus_keyboard_timer = nullptr;
 	emu_timer *m_battery_charge_timer = nullptr;
@@ -1749,10 +1752,46 @@ void datarover_state::set_phone_ring(bool ringing, bool signal_edge)
 }
 
 
+void datarover_state::update_phone_ring_input(bool ringing, bool signal_edge)
+{
+	if (ringing)
+	{
+		// The user-facing input is the ringing envelope.  Apollo sees the
+		// external DAA's detector output on MFIO0; a ringing telephone line
+		// therefore produces repeated edges rather than one envelope edge.
+		set_phone_ring(true, signal_edge);
+		m_phone_ring_timer->adjust(
+				attotime::from_msec(20), 0, attotime::from_msec(20));
+	}
+	else
+	{
+		m_phone_ring_timer->reset();
+		set_phone_ring(false, signal_edge);
+	}
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::phone_ring_tick)
+{
+	if (!m_phone_ring->read())
+	{
+		m_phone_ring_timer->reset();
+		set_phone_ring(false, true);
+		return;
+	}
+
+	set_phone_ring(!m_phone_ring_level, true);
+}
+
+
 void datarover_state::restore_inputs()
 {
 	set_phone_line(bool(m_phone_line->read()), true);
-	set_phone_ring(bool(m_phone_ring->read()), true);
+	if (!m_phone_ring->read())
+		update_phone_ring_input(false, true);
+	else if (!m_phone_ring_timer->enabled())
+		m_phone_ring_timer->adjust(
+				attotime::from_msec(20), 0, attotime::from_msec(20));
 	for (unsigned slot = 0; slot < m_modem_card.size(); ++slot)
 	{
 		if (m_modem_card[slot])
@@ -1940,7 +1979,7 @@ INPUT_CHANGED_MEMBER(datarover_state::phone_line_changed)
 
 INPUT_CHANGED_MEMBER(datarover_state::phone_ring_changed)
 {
-	set_phone_ring(bool(newval), true);
+	update_phone_ring_input(bool(newval), true);
 }
 
 
@@ -3424,6 +3463,8 @@ void datarover_state::machine_start()
 	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
 	m_telephone_pulse_timer =
 			timer_alloc(FUNC(datarover_state::telephone_pulse_digit), this);
+	m_phone_ring_timer =
+			timer_alloc(FUNC(datarover_state::phone_ring_tick), this);
 	m_magicbus_keyboard_timer =
 			timer_alloc(FUNC(datarover_state::magicbus_keyboard_tick), this);
 	m_battery_charge_timer =
@@ -3514,7 +3555,7 @@ void datarover_state::machine_reset()
 	m_betty.fill(0);
 	m_betty_pos_pending = 0;
 	m_betty_neg_pending = 0;
-	m_phone_ring_level = bool(m_phone_ring->read());
+	m_phone_ring_level = false;
 	for (std::array<u8, UART_RX_QUEUE_SIZE> &data : m_uart_rx_data)
 		data.fill(0);
 	m_uart_rx_head.fill(0);
@@ -3532,6 +3573,9 @@ void datarover_state::machine_reset()
 	m_microphone_phase = 0;
 	m_telecom_timer->reset();
 	m_telephone_pulse_timer->reset();
+	m_phone_ring_timer->reset();
+	if (m_phone_ring->read())
+		update_phone_ring_input(true, false);
 	m_telecom_dma_half_signalled = false;
 	m_telecom_loopback = 0;
 	m_telecom_phase_350 = 0;
