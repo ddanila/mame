@@ -16,7 +16,10 @@
 class mips1_disassembler : public util::disasm_interface
 {
 public:
-	mips1_disassembler() = default;
+	mips1_disassembler(bool multiply_to_gpr = false)
+		: m_multiply_to_gpr(multiply_to_gpr)
+	{
+	}
 	virtual ~mips1_disassembler() = default;
 
 	virtual u32 opcode_alignment() const override;
@@ -30,7 +33,7 @@ private:
 	uint32_t dasm_cop(uint32_t pc, int cop, uint32_t op, std::ostream &stream);
 	uint32_t dasm_cop1(uint32_t pc, uint32_t op, std::ostream &stream);
 
-
+	bool const m_multiply_to_gpr;
 };
 
 #endif // MAME_CPU_MIPS_MIPS1DSM_H
