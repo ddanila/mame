@@ -1059,6 +1059,8 @@ private:
 	bool telecom_dma_running() const;
 	void advance_telecom_dma();
 	s16 telephone_sample(double sample_rate);
+	void telephone_transmit_sample(s16 sample, double sample_rate);
+	void telephone_process_dtmf(double sample_rate);
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -1141,6 +1143,11 @@ private:
 	u32 m_telecom_loopback = 0;
 	u32 m_telecom_phase_350 = 0;
 	u32 m_telecom_phase_440 = 0;
+	static constexpr unsigned TELEPHONE_DTMF_SAMPLES = 288;
+	std::array<s16, TELEPHONE_DTMF_SAMPLES> m_telephone_dtmf_samples{};
+	u16 m_telephone_dtmf_count = 0;
+	char m_telephone_dtmf_last = 0;
+	bool m_telephone_dial_tone = false;
 	bool m_magicbus_request = false;
 	bool m_magicbus_assigned = false;
 	u8 m_magicbus_info_page = 0;
@@ -1645,6 +1652,9 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 			// its sample buffers yet.
 			m_telecom_phase_350 = 0;
 			m_telecom_phase_440 = 0;
+			m_telephone_dtmf_count = 0;
+			m_telephone_dtmf_last = 0;
+			m_telephone_dial_tone = BIT(m_betty[reg], 9);
 		}
 		if (reg == 2)
 			m_betty_pos_pending &= m_betty[2];
@@ -2169,14 +2179,23 @@ void datarover_state::advance_telecom_dma()
 	u32 ptr = (m_dino[DINO_SIB_DMA] & SIB_TEL_DMA_PTR) >> SIB_TEL_PTR_SHIFT;
 	address_space &space = m_maincpu->space(AS_PROGRAM);
 
-	// Transmit first: the DAA and phone line are not modelled, so the samples
-	// the software modem produces are consumed at the programmed rate.  With
-	// kSibLoopModeMask set the SIB feeds them straight back, which is what the
-	// modem's own loopback diagnostics expect.
+	// Transmit first so the automatic telephone exchange can decode the
+	// software modem's outgoing DTMF before it creates the receive sample.
+	// With kSibLoopModeMask set the SIB feeds transmit straight back, which is
+	// what the modem's own loopback diagnostics expect.
 	if (m_dino[DINO_SIB_DMA] & SIB_TEL_TX_DMA_EN)
 	{
 		u32 const base = m_dino[DINO_SIB_TEL_TX_START] & 0x1fff'fffc;
 		m_telecom_loopback = space.read_dword(base + ptr * 4);
+		if (m_phone_peer->read()
+				&& BIT(m_betty[0], 8)
+				&& BIT(m_betty[0], 9))
+		{
+			unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
+			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
+			telephone_transmit_sample(s16(m_telecom_loopback >> 16), sample_rate);
+			telephone_transmit_sample(s16(m_telecom_loopback), sample_rate);
+		}
 	}
 
 	if (m_dino[DINO_SIB_DMA] & SIB_TEL_RX_DMA_EN)
@@ -2190,7 +2209,8 @@ void datarover_state::advance_telecom_dma()
 		}
 		else if (m_phone_peer->read()
 				&& BIT(m_betty[0], 8)
-				&& BIT(m_betty[0], 9))
+				&& BIT(m_betty[0], 9)
+				&& m_telephone_dial_tone)
 		{
 			unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
 			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
@@ -2250,6 +2270,86 @@ s16 datarover_state::telephone_sample(double sample_rate)
 	m_telecom_phase_440 += u32(std::lround(
 			(440.0 * 4'294'967'296.0) / sample_rate));
 	return sample;
+}
+
+
+void datarover_state::telephone_transmit_sample(s16 sample, double sample_rate)
+{
+	m_telephone_dtmf_samples[m_telephone_dtmf_count++] = sample;
+	if (m_telephone_dtmf_count == m_telephone_dtmf_samples.size())
+	{
+		telephone_process_dtmf(sample_rate);
+		m_telephone_dtmf_count = 0;
+	}
+}
+
+
+void datarover_state::telephone_process_dtmf(double sample_rate)
+{
+	static constexpr std::array<unsigned, 4> ROW_FREQUENCIES{
+			697, 770, 852, 941 };
+	static constexpr std::array<unsigned, 4> COLUMN_FREQUENCIES{
+			1209, 1336, 1477, 1633 };
+	static constexpr char DIGITS[4][4]{
+			{ '1', '2', '3', 'A' },
+			{ '4', '5', '6', 'B' },
+			{ '7', '8', '9', 'C' },
+			{ '*', '0', '#', 'D' } };
+	static constexpr double TWO_PI = 6.28318530717958647692;
+
+	auto const amplitude = [this, sample_rate](unsigned frequency)
+	{
+		double real = 0.0;
+		double imaginary = 0.0;
+		for (unsigned index = 0; index < m_telephone_dtmf_samples.size(); ++index)
+		{
+			double const angle =
+					TWO_PI * double(frequency) * double(index) / sample_rate;
+			real += double(m_telephone_dtmf_samples[index]) * std::cos(angle);
+			imaginary -= double(m_telephone_dtmf_samples[index]) * std::sin(angle);
+		}
+		return 2.0 * std::sqrt(real * real + imaginary * imaginary)
+				/ double(m_telephone_dtmf_samples.size());
+	};
+
+	std::array<double, 4> rows;
+	std::array<double, 4> columns;
+	for (unsigned index = 0; index < rows.size(); ++index)
+	{
+		rows[index] = amplitude(ROW_FREQUENCIES[index]);
+		columns[index] = amplitude(COLUMN_FREQUENCIES[index]);
+	}
+	auto const strongest = [](std::array<double, 4> const &values)
+	{
+		return unsigned(std::distance(
+				values.begin(), std::max_element(values.begin(), values.end())));
+	};
+	unsigned const row = strongest(rows);
+	unsigned const column = strongest(columns);
+	double row_runner_up = 0.0;
+	double column_runner_up = 0.0;
+	for (unsigned index = 0; index < 4; ++index)
+	{
+		if (index != row)
+			row_runner_up = std::max(row_runner_up, rows[index]);
+		if (index != column)
+			column_runner_up = std::max(column_runner_up, columns[index]);
+	}
+	char digit = 0;
+	if (rows[row] >= 500.0
+			&& columns[column] >= 500.0
+			&& row_runner_up < rows[row] * 0.55
+			&& column_runner_up < columns[column] * 0.55)
+	{
+		digit = DIGITS[row][column];
+	}
+
+	if (digit && digit != m_telephone_dtmf_last)
+	{
+		osd_printf_info("Telephone exchange DTMF: %c\n", digit);
+		m_telephone_dial_tone = false;
+	}
+	m_telephone_dtmf_last = digit;
 }
 
 
@@ -3201,6 +3301,10 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telecom_loopback));
 	save_item(NAME(m_telecom_phase_350));
 	save_item(NAME(m_telecom_phase_440));
+	save_item(NAME(m_telephone_dtmf_samples));
+	save_item(NAME(m_telephone_dtmf_count));
+	save_item(NAME(m_telephone_dtmf_last));
+	save_item(NAME(m_telephone_dial_tone));
 	save_item(NAME(m_magicbus_request));
 	save_item(NAME(m_magicbus_assigned));
 	save_item(NAME(m_magicbus_info_page));
@@ -3261,6 +3365,10 @@ void datarover_state::machine_reset()
 	m_telecom_loopback = 0;
 	m_telecom_phase_350 = 0;
 	m_telecom_phase_440 = 0;
+	m_telephone_dtmf_samples.fill(0);
+	m_telephone_dtmf_count = 0;
+	m_telephone_dtmf_last = 0;
+	m_telephone_dial_tone = false;
 	m_magicbus_request = false;
 	m_magicbus_assigned = false;
 	m_magicbus_info_page = 0;
