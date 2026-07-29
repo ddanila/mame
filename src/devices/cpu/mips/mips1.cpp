@@ -301,10 +301,10 @@ void mips1core_device_base::device_start()
 	set_icountptr(m_icount);
 
 	// register our state for the debugger
-	state_add(STATE_GENPC,      "GENPC",     m_pc).noshow();
+	state_add(STATE_GENPC,      "GENPC",     m_pc).callimport().noshow();
 	state_add(STATE_GENPCBASE,  "CURPC",     m_pc).noshow();
 
-	state_add(MIPS1_PC,                   "PC",        m_pc);
+	state_add(MIPS1_PC,                   "PC",        m_pc).callimport();
 	state_add(MIPS1_COP0 + COP0_Status,   "SR",        m_cop0[COP0_Status]);
 
 	for (unsigned i = 0; i < std::size(m_r); i++)
@@ -341,6 +341,15 @@ void mips1core_device_base::device_start()
 	save_pointer(STRUCT_MEMBER(m_icache.line, data), m_icache.lines());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, tag), m_dcache.lines());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, data), m_dcache.lines());
+}
+
+void mips1core_device_base::state_import(device_state_entry const &entry)
+{
+	if (entry.index() == STATE_GENPC || entry.index() == MIPS1_PC)
+	{
+		m_branch_state = NONE;
+		m_branch_target = 0;
+	}
 }
 
 void r3041_device::device_start()

@@ -22,6 +22,7 @@ protected:
 	// device_t implementation
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void state_import(device_state_entry const &entry) override;
 
 	// device_execute_interface implementation
 	virtual u32 execute_min_cycles() const noexcept override { return 1; }
