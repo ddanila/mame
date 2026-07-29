@@ -832,6 +832,7 @@ public:
 		, m_touch_button(*this, "TOUCH_BUTTON")
 		, m_power_button(*this, "POWER_BUTTON")
 		, m_phone_line(*this, "PHONE_LINE")
+		, m_phone_ring(*this, "PHONE_RING")
 		, m_magicbus_accessory(*this, "MAGICBUS_ACCESSORY")
 		, m_irda_carrier(*this, "IRDA_CARRIER")
 		, m_microphone_source(*this, "MICROPHONE_SOURCE")
@@ -845,6 +846,7 @@ public:
 	INPUT_CHANGED_MEMBER(pccard_battery_changed);
 	INPUT_CHANGED_MEMBER(power_changed);
 	INPUT_CHANGED_MEMBER(phone_line_changed);
+	INPUT_CHANGED_MEMBER(phone_ring_changed);
 	INPUT_CHANGED_MEMBER(main_battery_changed);
 	INPUT_CHANGED_MEMBER(battery_cover_changed);
 	INPUT_CHANGED_MEMBER(irda_carrier_changed);
@@ -948,6 +950,7 @@ private:
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
 	static constexpr u32 DINO_MFIO_DATA_OUTPUT = 0x184 / 4;
+	static constexpr u32 DINO_MFIO_DATA_INPUT = 0x18c / 4;
 
 	// Apollo's platform-specific MFIO assignments from Gen2MFS.asm.h.
 	// The LCD and charger signals are active high; Magic Bus Vcc-off is
@@ -956,6 +959,9 @@ private:
 	static constexpr u32 DINO_MFIO_LCD_POWER = 0x0002'0000;
 	static constexpr u32 DINO_MFIO_MBUS_VCC_OFF = 0x0001'0000;
 	static constexpr u32 DINO_MFIO_CHARGER_ENABLE = 0x0000'0002;
+	static constexpr u32 DINO_MFIO_TELECOM_RING = 0x0000'0001;
+	static constexpr u32 INT3_MFIO0_POS = 0x0000'0001;
+	static constexpr u32 INT4_MFIO0_NEG = 0x0000'0001;
 
 	// PowerSupplyGen2MFS reads the external-power and battery-cover inputs
 	// from these bits: ACAdapterAttached takes powerControl bit 30, and
@@ -1025,6 +1031,7 @@ private:
 	void betty_command(u32 command, bool subframe1);
 	void update_betty_irq();
 	void set_phone_line(bool connected, bool signal_edge);
+	void set_phone_ring(bool ringing, bool signal_edge);
 	void restore_inputs();
 	u16 touch_adc_value() const;
 	u16 main_battery_reading() const;
@@ -1091,6 +1098,7 @@ private:
 	required_ioport m_touch_button;
 	required_ioport m_power_button;
 	required_ioport m_phone_line;
+	required_ioport m_phone_ring;
 	required_ioport m_magicbus_accessory;
 	required_ioport m_irda_carrier;
 	required_ioport m_microphone_source;
@@ -1101,6 +1109,7 @@ private:
 	std::array<u16, 16> m_betty{};
 	u16 m_betty_pos_pending = 0;
 	u16 m_betty_neg_pending = 0;
+	bool m_phone_ring_level = false;
 	std::array<std::array<u8, UART_RX_QUEUE_SIZE>, 2> m_uart_rx_data{};
 	std::array<u32, 2> m_uart_rx_head{};
 	std::array<u32, 2> m_uart_rx_count{};
@@ -1693,10 +1702,23 @@ void datarover_state::set_phone_line(bool connected, bool signal_edge)
 	update_irq();
 }
 
+void datarover_state::set_phone_ring(bool ringing, bool signal_edge)
+{
+	if (m_phone_ring_level == ringing)
+		return;
+
+	m_phone_ring_level = ringing;
+	if (signal_edge)
+		m_dino[ringing ? DINO_INTERRUPT3 : DINO_INTERRUPT4] |=
+				ringing ? INT3_MFIO0_POS : INT4_MFIO0_NEG;
+	update_irq();
+}
+
 
 void datarover_state::restore_inputs()
 {
 	set_phone_line(bool(m_phone_line->read()), true);
+	set_phone_ring(bool(m_phone_ring->read()), true);
 	for (unsigned slot = 0; slot < m_modem_card.size(); ++slot)
 	{
 		if (m_modem_card[slot])
@@ -1880,6 +1902,11 @@ INPUT_CHANGED_MEMBER(datarover_state::power_changed)
 INPUT_CHANGED_MEMBER(datarover_state::phone_line_changed)
 {
 	set_phone_line(bool(newval), true);
+}
+
+INPUT_CHANGED_MEMBER(datarover_state::phone_ring_changed)
+{
+	set_phone_ring(bool(newval), true);
 }
 
 
@@ -2729,6 +2756,11 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 				| (pccard_bvd1_level(0) ? 0x0000'0002 : 0)
 				| (pccard_bvd1_level(1) ? 0x0000'0001 : 0);
 
+	case DINO_MFIO_DATA_INPUT:
+		// Apollo routes the telephone DAA's ring detector to MFIO pin 0.
+		return (m_dino[offset] & ~DINO_MFIO_TELECOM_RING)
+				| (m_phone_ring_level ? DINO_MFIO_TELECOM_RING : 0);
+
 	case DINO_POWER_CONTROL:
 		// Power-good is a read-only status input.  Without it, the low-level
 		// boot path immediately invokes CommonShutdown and restarts forever.
@@ -3097,6 +3129,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_betty));
 	save_item(NAME(m_betty_pos_pending));
 	save_item(NAME(m_betty_neg_pending));
+	save_item(NAME(m_phone_ring_level));
 	save_item(NAME(m_uart_rx_data));
 	save_item(NAME(m_uart_rx_head));
 	save_item(NAME(m_uart_rx_count));
@@ -3155,6 +3188,7 @@ void datarover_state::machine_reset()
 	m_betty.fill(0);
 	m_betty_pos_pending = 0;
 	m_betty_neg_pending = 0;
+	m_phone_ring_level = bool(m_phone_ring->read());
 	for (std::array<u8, UART_RX_QUEUE_SIZE> &data : m_uart_rx_data)
 		data.fill(0);
 	m_uart_rx_head.fill(0);
@@ -3266,6 +3300,9 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x01, "Connected")
 	PORT_CONFSETTING(0x00, "Disconnected")
 	PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::phone_line_changed), 0)
+
+	PORT_START("PHONE_RING")
+	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Incoming telephone ring") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::phone_ring_changed), 0)
 
 	// Resuming battery-backed state normally advances the RTC by the host
 	// wall-clock time that passed while the machine was off, which is what a
