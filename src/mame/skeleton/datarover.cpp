@@ -877,6 +877,7 @@ private:
 	static constexpr u32 DINO_SIB_SOUND_RX_START = 0x064 / 4;
 	static constexpr u32 DINO_SIB_SOUND_TX_START = 0x068 / 4;
 	static constexpr u32 DINO_SIB_DMA = 0x090 / 4;
+	static constexpr u32 SIB_STATUS_AUDIO_VALID = 0x0002'0000;
 
 	// DinoModule.sibDMA, named by the SDK's Dino.asm.h.
 	static constexpr u32 SIB_SOUND_DMA_ONCE = 0x8000'0000; // kSibSoundDmaOnceMask
@@ -1572,6 +1573,7 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 
 	if (write && reg != 12)
 	{
+		u16 const old_value = m_betty[reg];
 		switch (reg)
 		{
 		case 0:
@@ -1601,6 +1603,26 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 		{
 			m_betty[11] = 0x8000 | ((touch_adc_value() & 0x03ff) << 5);
 		}
+		if (reg == 8 && BIT(old_value ^ m_betty[reg], 14))
+		{
+			// Betty's sound-input enable starts/stops Dino receive DMA as a
+			// hardware side effect.  SibCmdStartSoundIn sets this bit after
+			// programming the receive address and size; unlike sound output,
+			// the ROM never writes kSibEnSoundRxDmaMask itself.
+			if (BIT(m_betty[reg], 14))
+			{
+				m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_DMA_PTR;
+				m_dino[DINO_SIB_DMA] |= SIB_SOUND_RX_DMA_EN;
+				m_sound_dma_half_signalled = false;
+				m_microphone_head = 0;
+				m_microphone_count = 0;
+				m_microphone_phase = 0;
+			}
+			else
+			{
+				m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_RX_DMA_EN;
+			}
+		}
 		if (reg == 2)
 			m_betty_pos_pending &= m_betty[2];
 		else if (reg == 3)
@@ -1608,7 +1630,13 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 		update_betty_irq();
 	}
 
-	m_dino[subframe1 ? DINO_SIB_SF1_STATUS : DINO_SIB_SF0_STATUS] = m_betty[reg];
+	// Betty supplies valid audio slots once microphone input is enabled.
+	// SibCmdStartSoundIn waits for this Dino status bit before completing;
+	// without it the SIB command queue remains occupied and StopSoundIn can
+	// never run.
+	m_dino[subframe1 ? DINO_SIB_SF1_STATUS : DINO_SIB_SF0_STATUS] =
+			m_betty[reg]
+			| (BIT(m_betty[8], 14) ? SIB_STATUS_AUDIO_VALID : 0);
 	m_dino[DINO_INTERRUPT1] |= subframe1 ? 0x00000080 : 0x00000100;
 	update_irq();
 }
