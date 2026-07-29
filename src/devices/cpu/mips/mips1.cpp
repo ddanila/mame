@@ -211,12 +211,13 @@ DEFINE_DEVICE_TYPE(SONYPS2_IOP, iop_device,       "sonyiop", "Sony Playstation 2
 
 ALLOW_SAVE_TYPE(mips1core_device_base::branch_state);
 
-mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws)
+mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr)
 	: cpu_device(mconfig, type, tag, owner, clock)
 	, m_program_config_be("program", ENDIANNESS_BIG, 32, 32)
 	, m_program_config_le("program", ENDIANNESS_LITTLE, 32, 32)
 	, m_cpurev(cpurev)
 	, m_endianness(ENDIANNESS_BIG)
+	, m_multiply_to_gpr(multiply_to_gpr)
 	, m_icount(0)
 	, m_icache(icache_size)
 	, m_dcache(dcache_size)
@@ -284,7 +285,7 @@ r3081_device::r3081_device(machine_config const &mconfig, char const *tag, devic
 }
 
 r3900_device::r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
-	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true)
+	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true, true)
 {
 }
 
@@ -462,7 +463,13 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
-						m_icount -= 11;
+						if (m_multiply_to_gpr)
+						{
+							m_r[RDREG] = m_lo;
+							m_icount--;
+						}
+						else
+							m_icount -= 11;
 					}
 					break;
 				case 0x19: // MULTU
@@ -471,7 +478,13 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
-						m_icount -= 11;
+						if (m_multiply_to_gpr)
+						{
+							m_r[RDREG] = m_lo;
+							m_icount--;
+						}
+						else
+							m_icount -= 11;
 					}
 					break;
 				case 0x1a: // DIV
@@ -910,7 +923,7 @@ void r3900_device::handle_special2(u32 const op)
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
 {
-	return std::make_unique<mips1_disassembler>();
+	return std::make_unique<mips1_disassembler>(m_multiply_to_gpr);
 }
 
 void mips1core_device_base::generate_exception(u32 exception, bool refill)

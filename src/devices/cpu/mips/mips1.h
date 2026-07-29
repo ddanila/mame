@@ -17,7 +17,7 @@ public:
 	void berr_w(int state) { m_bus_error = bool(state); }
 
 protected:
-	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws);
+	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr = false);
 
 	// device_t implementation
 	virtual void device_start() override ATTR_COLD;
@@ -107,6 +107,7 @@ protected:
 	// configuration
 	u32 const m_cpurev;
 	endianness_t m_endianness;
+	bool const m_multiply_to_gpr;
 
 	// core registers
 	u32 m_pc;

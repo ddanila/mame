@@ -269,8 +269,16 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 				case 0x11:  util::stream_format(stream, "mthi   %s", reg[rs]);                                  break;
 				case 0x12:  util::stream_format(stream, "mflo   %s", reg[rd]);                                  break;
 				case 0x13:  util::stream_format(stream, "mtlo   %s", reg[rs]);                                  break;
-				case 0x18:  util::stream_format(stream, "mult   %s,%s", reg[rs], reg[rt]);                      break;
-				case 0x19:  util::stream_format(stream, "multu  %s,%s", reg[rs], reg[rt]);                      break;
+				case 0x18:  if (m_multiply_to_gpr && rd)
+								util::stream_format(stream, "mult   %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+							else
+								util::stream_format(stream, "mult   %s,%s", reg[rs], reg[rt]);
+							break;
+				case 0x19:  if (m_multiply_to_gpr && rd)
+								util::stream_format(stream, "multu  %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+							else
+								util::stream_format(stream, "multu  %s,%s", reg[rs], reg[rt]);
+							break;
 				case 0x1a:  util::stream_format(stream, "div    %s,%s", reg[rs], reg[rt]);                      break;
 				case 0x1b:  util::stream_format(stream, "divu   %s,%s", reg[rs], reg[rt]);                      break;
 				case 0x20:  util::stream_format(stream, "add    %s,%s,%s", reg[rd], reg[rs], reg[rt]);          break;
