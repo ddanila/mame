@@ -832,6 +832,7 @@ public:
 		, m_power_button(*this, "POWER_BUTTON")
 		, m_phone_line(*this, "PHONE_LINE")
 		, m_phone_ring(*this, "PHONE_RING")
+		, m_phone_peer(*this, "PHONE_PEER")
 		, m_magicbus_accessory(*this, "MAGICBUS_ACCESSORY")
 		, m_irda_carrier(*this, "IRDA_CARRIER")
 		, m_microphone_source(*this, "MICROPHONE_SOURCE")
@@ -1056,6 +1057,7 @@ private:
 	s16 microphone_sample(double sample_rate);
 	bool telecom_dma_running() const;
 	void advance_telecom_dma();
+	s16 telephone_sample(double sample_rate);
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -1098,6 +1100,7 @@ private:
 	required_ioport m_power_button;
 	required_ioport m_phone_line;
 	required_ioport m_phone_ring;
+	required_ioport m_phone_peer;
 	required_ioport m_magicbus_accessory;
 	required_ioport m_irda_carrier;
 	required_ioport m_microphone_source;
@@ -1135,6 +1138,8 @@ private:
 	sound_stream *m_microphone_stream = nullptr;
 	bool m_telecom_dma_half_signalled = false;
 	u32 m_telecom_loopback = 0;
+	u32 m_telecom_phase_350 = 0;
+	u32 m_telecom_phase_440 = 0;
 	bool m_magicbus_request = false;
 	bool m_magicbus_assigned = false;
 	u8 m_magicbus_info_page = 0;
@@ -1630,6 +1635,15 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 			{
 				m_dino[DINO_SIB_DMA] &= ~SIB_SOUND_RX_DMA_EN;
 			}
+		}
+		if (reg == 0 && BIT(old_value ^ m_betty[reg], 9))
+		{
+			// A new off-hook interval starts a fresh local-exchange signal.
+			// Keeping phase here, rather than at DMA start, matches the DAA:
+			// the line exists independently of whether the modem has armed
+			// its sample buffers yet.
+			m_telecom_phase_350 = 0;
+			m_telecom_phase_440 = 0;
 		}
 		if (reg == 2)
 			m_betty_pos_pending &= m_betty[2];
@@ -2168,7 +2182,22 @@ void datarover_state::advance_telecom_dma()
 	{
 		u32 const base = m_dino[DINO_SIB_TEL_RX_START] & 0x1fff'fffc;
 		bool const loopback = BIT(m_dino[DINO_SIB_CONTROL], 3);
-		space.write_dword(base + ptr * 4, loopback ? m_telecom_loopback : 0);
+		u32 received = 0;
+		if (loopback)
+		{
+			received = m_telecom_loopback;
+		}
+		else if (m_phone_peer->read()
+				&& BIT(m_betty[0], 8)
+				&& BIT(m_betty[0], 9))
+		{
+			unsigned const divisor = BIT(m_dino[DINO_SIB_CONTROL], 16, 7) + 1;
+			double const sample_rate = 9'216'000.0 / (32.0 * divisor);
+			u16 const first = u16(telephone_sample(sample_rate));
+			u16 const second = u16(telephone_sample(sample_rate));
+			received = (u32(first) << 16) | second;
+		}
+		space.write_dword(base + ptr * 4, received);
 	}
 
 	++ptr;
@@ -2199,6 +2228,27 @@ void datarover_state::advance_telecom_dma()
 			| ((ptr << SIB_TEL_PTR_SHIFT) & SIB_TEL_DMA_PTR);
 
 	update_irq();
+}
+
+
+s16 datarover_state::telephone_sample(double sample_rate)
+{
+	// North American dial tone is the continuous sum of 350 Hz and 440 Hz.
+	// The Apollo USA ROM's call-progress detector covers this pair.  Fixed
+	// phase accumulators make the exchange deterministic across hosts and
+	// save states.
+	static constexpr double TWO_PI = 6.28318530717958647692;
+	auto const sine = [](u32 phase)
+	{
+		return std::sin(double(phase) * (TWO_PI / 4'294'967'296.0));
+	};
+	s16 const sample = s16(std::lround(
+			(sine(m_telecom_phase_350) + sine(m_telecom_phase_440)) * 4'000.0));
+	m_telecom_phase_350 += u32(std::lround(
+			(350.0 * 4'294'967'296.0) / sample_rate));
+	m_telecom_phase_440 += u32(std::lround(
+			(440.0 * 4'294'967'296.0) / sample_rate));
+	return sample;
 }
 
 
@@ -3148,6 +3198,8 @@ void datarover_state::machine_start()
 	save_item(NAME(m_microphone_phase));
 	save_item(NAME(m_telecom_dma_half_signalled));
 	save_item(NAME(m_telecom_loopback));
+	save_item(NAME(m_telecom_phase_350));
+	save_item(NAME(m_telecom_phase_440));
 	save_item(NAME(m_magicbus_request));
 	save_item(NAME(m_magicbus_assigned));
 	save_item(NAME(m_magicbus_info_page));
@@ -3206,6 +3258,8 @@ void datarover_state::machine_reset()
 	m_telecom_timer->reset();
 	m_telecom_dma_half_signalled = false;
 	m_telecom_loopback = 0;
+	m_telecom_phase_350 = 0;
+	m_telecom_phase_440 = 0;
 	m_magicbus_request = false;
 	m_magicbus_assigned = false;
 	m_magicbus_info_page = 0;
@@ -3302,6 +3356,11 @@ static INPUT_PORTS_START(datarover840)
 
 	PORT_START("PHONE_RING")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER) PORT_NAME("Incoming telephone ring") PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(datarover_state::phone_ring_changed), 0)
+
+	PORT_START("PHONE_PEER")
+	PORT_CONFNAME(0x01, 0x01, "Telephone exchange")
+	PORT_CONFSETTING(0x00, "Silent line")
+	PORT_CONFSETTING(0x01, "Automatic test exchange")
 
 	// Resuming battery-backed state normally advances the RTC by the host
 	// wall-clock time that passed while the machine was off, which is what a
