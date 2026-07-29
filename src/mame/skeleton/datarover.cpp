@@ -1061,6 +1061,7 @@ private:
 	s16 telephone_sample(double sample_rate);
 	void telephone_transmit_sample(s16 sample, double sample_rate);
 	void telephone_process_dtmf(double sample_rate);
+	void telephone_hookswitch_changed(bool offhook);
 	void update_periodic_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
@@ -1071,6 +1072,7 @@ private:
 	TIMER_CALLBACK_MEMBER(rtc_persist_tick);
 	TIMER_CALLBACK_MEMBER(sib_tick);
 	TIMER_CALLBACK_MEMBER(telecom_tick);
+	TIMER_CALLBACK_MEMBER(telephone_pulse_digit);
 	TIMER_CALLBACK_MEMBER(sound_tick);
 	TIMER_CALLBACK_MEMBER(magicbus_keyboard_tick);
 	TIMER_CALLBACK_MEMBER(battery_charge_tick);
@@ -1148,6 +1150,9 @@ private:
 	u16 m_telephone_dtmf_count = 0;
 	char m_telephone_dtmf_last = 0;
 	bool m_telephone_dial_tone = false;
+	u8 m_telephone_pulse_count = 0;
+	u64 m_telephone_pulse_break_start = 0;
+	bool m_telephone_pulse_break = false;
 	bool m_magicbus_request = false;
 	bool m_magicbus_assigned = false;
 	u8 m_magicbus_info_page = 0;
@@ -1167,6 +1172,7 @@ private:
 	u16 m_magicbus_key_count = 0;
 	u16 m_main_battery_charge = 0;
 	emu_timer *m_telecom_timer = nullptr;
+	emu_timer *m_telephone_pulse_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
 	emu_timer *m_magicbus_keyboard_timer = nullptr;
 	emu_timer *m_battery_charge_timer = nullptr;
@@ -1645,17 +1651,7 @@ void datarover_state::betty_command(u32 command, bool subframe1)
 			}
 		}
 		if (reg == 0 && BIT(old_value ^ m_betty[reg], 9))
-		{
-			// A new off-hook interval starts a fresh local-exchange signal.
-			// Keeping phase here, rather than at DMA start, matches the DAA:
-			// the line exists independently of whether the modem has armed
-			// its sample buffers yet.
-			m_telecom_phase_350 = 0;
-			m_telecom_phase_440 = 0;
-			m_telephone_dtmf_count = 0;
-			m_telephone_dtmf_last = 0;
-			m_telephone_dial_tone = BIT(m_betty[reg], 9);
-		}
+			telephone_hookswitch_changed(BIT(m_betty[reg], 9));
 		if (reg == 2)
 			m_betty_pos_pending &= m_betty[2];
 		else if (reg == 3)
@@ -2350,6 +2346,65 @@ void datarover_state::telephone_process_dtmf(double sample_rate)
 		m_telephone_dial_tone = false;
 	}
 	m_telephone_dtmf_last = digit;
+}
+
+
+void datarover_state::telephone_hookswitch_changed(bool offhook)
+{
+	u64 const now = machine().time().as_ticks(1'000'000);
+
+	if (!offhook)
+	{
+		// A pulse opens the loop for tens of milliseconds.  Cancel the digit
+		// gap while another possible pulse is in progress; a sustained
+		// on-hook state is simply a hangup and produces no digit.
+		m_telephone_pulse_timer->reset();
+		m_telephone_pulse_break_start = now;
+		m_telephone_pulse_break = true;
+		m_telephone_dial_tone = false;
+		return;
+	}
+
+	bool valid_pulse = false;
+	if (m_telephone_pulse_break)
+	{
+		u64 const break_usecs = now - m_telephone_pulse_break_start;
+		valid_pulse = break_usecs >= 20'000 && break_usecs <= 150'000;
+		m_telephone_pulse_break = false;
+	}
+
+	if (valid_pulse && m_telephone_pulse_count < 10)
+	{
+		++m_telephone_pulse_count;
+		m_telephone_pulse_timer->adjust(attotime::from_msec(400));
+		return;
+	}
+
+	// An initial off-hook transition, or one following a sustained hangup,
+	// starts a fresh call.  The line exists independently of whether the
+	// modem has armed its DMA buffers yet.
+	m_telephone_pulse_count = 0;
+	m_telecom_phase_350 = 0;
+	m_telecom_phase_440 = 0;
+	m_telephone_dtmf_count = 0;
+	m_telephone_dtmf_last = 0;
+	m_telephone_dial_tone = true;
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::telephone_pulse_digit)
+{
+	if (m_phone_peer->read()
+			&& BIT(m_betty[0], 8)
+			&& BIT(m_betty[0], 9)
+			&& m_telephone_pulse_count)
+	{
+		char const digit = m_telephone_pulse_count == 10
+				? '0'
+				: char('0' + m_telephone_pulse_count);
+		osd_printf_info("Telephone exchange pulse digit: %c\n", digit);
+	}
+	m_telephone_pulse_count = 0;
 }
 
 
@@ -3262,6 +3317,8 @@ void datarover_state::machine_start()
 	m_sib_timer = timer_alloc(FUNC(datarover_state::sib_tick), this);
 	m_sound_timer = timer_alloc(FUNC(datarover_state::sound_tick), this);
 	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
+	m_telephone_pulse_timer =
+			timer_alloc(FUNC(datarover_state::telephone_pulse_digit), this);
 	m_magicbus_keyboard_timer =
 			timer_alloc(FUNC(datarover_state::magicbus_keyboard_tick), this);
 	m_battery_charge_timer =
@@ -3305,6 +3362,9 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telephone_dtmf_count));
 	save_item(NAME(m_telephone_dtmf_last));
 	save_item(NAME(m_telephone_dial_tone));
+	save_item(NAME(m_telephone_pulse_count));
+	save_item(NAME(m_telephone_pulse_break_start));
+	save_item(NAME(m_telephone_pulse_break));
 	save_item(NAME(m_magicbus_request));
 	save_item(NAME(m_magicbus_assigned));
 	save_item(NAME(m_magicbus_info_page));
@@ -3361,6 +3421,7 @@ void datarover_state::machine_reset()
 	m_microphone_count = 0;
 	m_microphone_phase = 0;
 	m_telecom_timer->reset();
+	m_telephone_pulse_timer->reset();
 	m_telecom_dma_half_signalled = false;
 	m_telecom_loopback = 0;
 	m_telecom_phase_350 = 0;
@@ -3369,6 +3430,9 @@ void datarover_state::machine_reset()
 	m_telephone_dtmf_count = 0;
 	m_telephone_dtmf_last = 0;
 	m_telephone_dial_tone = false;
+	m_telephone_pulse_count = 0;
+	m_telephone_pulse_break_start = 0;
+	m_telephone_pulse_break = false;
 	m_magicbus_request = false;
 	m_magicbus_assigned = false;
 	m_magicbus_info_page = 0;
