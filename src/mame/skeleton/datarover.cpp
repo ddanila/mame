@@ -880,6 +880,8 @@ protected:
 	virtual void sound_stream_update(sound_stream &stream) override;
 
 private:
+	static constexpr u32 DINO_MEMORY_CONFIGURATION0 = 0x000 / 4;
+	static constexpr u32 DINO_MEMORY_CS0_32_BIT = 0x0000'0001;
 	static constexpr u32 DINO_UART_A_CONTROL1 = 0x0b0 / 4;
 	static constexpr u32 DINO_UART_A_CONTROL2 = 0x0b4 / 4;
 	static constexpr u32 DINO_UART_A_HOLD = 0x0c4 / 4;
@@ -1326,7 +1328,7 @@ void datarover_state::common_memory_map(address_map &map)
 
 u32 datarover_state::vector_page_r(offs_t offset, u32 mem_mask)
 {
-	if (BIT(m_dino[0], 25))
+	if (BIT(m_dino[DINO_MEMORY_CONFIGURATION0], 25))
 		return m_ram[(VECTOR_PAGE_RAM_OFFSET / 4) + offset];
 	if (m_flash[0])
 		return flash_r<VECTOR_PAGE_ROM_OFFSET>(offset, mem_mask);
@@ -1339,7 +1341,7 @@ void datarover_state::vector_page_w(offs_t offset, u32 data, u32 mem_mask)
 {
 	// SetupVectorDispatching copies this ROM page to RAM at 0x200, then
 	// enables Dino address-remap region 1 before patching its dispatch stub.
-	if (BIT(m_dino[0], 25))
+	if (BIT(m_dino[DINO_MEMORY_CONFIGURATION0], 25))
 		COMBINE_DATA(&m_ram[(VECTOR_PAGE_RAM_OFFSET / 4) + offset]);
 	else if (m_flash[0])
 		flash_w<VECTOR_PAGE_ROM_OFFSET>(offset, data, mem_mask);
@@ -4101,6 +4103,9 @@ void datarover_state::machine_reset()
 	}
 
 	m_dino.fill(0);
+	// Apollo boots from a 32-bit CS0 ROM bus.  MM_InitializeDino preserves
+	// this reset/strap field while programming the rest of memoryConfiguration0.
+	m_dino[DINO_MEMORY_CONFIGURATION0] = DINO_MEMORY_CS0_32_BIT;
 	// Both transmit holding registers are empty after reset.  Magic Cap's
 	// serial-server initialization explicitly clears these status bits before
 	// enabling an interrupt-driven transfer; the IDT monitor polls them.
