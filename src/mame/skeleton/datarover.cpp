@@ -977,6 +977,13 @@ private:
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
 	static constexpr u32 DINO_MFIO_DATA_OUTPUT = 0x184 / 4;
 	static constexpr u32 DINO_MFIO_DATA_INPUT = 0x18c / 4;
+	static constexpr u32 DINO_MASTER_CLOCK = 0x1c0 / 4;
+	static constexpr u32 DINO_CLOCK_VIDEO = 0x0004'0000;
+	static constexpr u32 DINO_CLOCK_MBUS = 0x0002'0000;
+	static constexpr u32 DINO_CLOCK_TIMER = 0x0000'8000;
+	static constexpr u32 DINO_CLOCK_SIB = 0x0000'0800;
+	static constexpr u32 DINO_CLOCK_UART_A = 0x0000'0002;
+	static constexpr u32 DINO_CLOCK_UART_B = 0x0000'0001;
 
 	// Apollo's platform-specific MFIO assignments from Gen2MFS.asm.h.
 	// The LCD and charger signals are active high; Magic Bus Vcc-off is
@@ -1084,6 +1091,7 @@ private:
 	void magicbus_command(u16 command);
 	void magicbus_deliver_response();
 	void magicbus_accept_host_data();
+	bool dino_clock_enabled(u32 mask) const;
 	void update_sib_timers();
 	bool sound_dma_running() const;
 	void advance_sound_dma();
@@ -1505,7 +1513,8 @@ u32 datarover_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, 
 
 	// Apollo drives the panel supply from MFIO 17.  The framebuffer remains
 	// intact while the rail is off, just as it does through normal suspend.
-	if (!(m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_LCD_POWER))
+	if (!(m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_LCD_POWER)
+			|| !dino_clock_enabled(DINO_CLOCK_VIDEO))
 	{
 		bitmap.fill(rgb_t::black(), cliprect);
 		return 0;
@@ -1538,11 +1547,12 @@ u32 datarover_state::uart_control_r(unsigned channel) const
 	u32 const control =
 			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1];
 	u32 result = (control & ~DINO_UART_STATUS) | DINO_UART_EMPTY_STATUS;
-	if (BIT(control, 0))
+	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	if (BIT(control, 0) && dino_clock_enabled(clock))
 		result |= DINO_UART_ENABLED_STATUS;
-	if (m_uart_rx_count[channel])
+	if (dino_clock_enabled(clock) && m_uart_rx_count[channel])
 		result |= DINO_UART_RX_HOLD_FULL;
-	if (m_uart_rx_count[channel] > 1)
+	if (dino_clock_enabled(clock) && m_uart_rx_count[channel] > 1)
 		result |= DINO_UART_PRX_HOLD_FULL;
 
 	return result;
@@ -1559,6 +1569,10 @@ void datarover_state::uart_configure(unsigned channel)
 
 u32 datarover_state::uart_hold_r(unsigned channel)
 {
+	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	if (!dino_clock_enabled(clock))
+		return 0;
+
 	u8 data = 0;
 	if (m_uart_rx_count[channel])
 	{
@@ -1574,10 +1588,12 @@ u32 datarover_state::uart_hold_r(unsigned channel)
 
 void datarover_state::uart_hold_w(unsigned channel, u32 data, u32 mem_mask)
 {
-	if (ACCESSING_BITS_0_7)
+	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	bool const pulsed = uart_pulsed(channel);
+	if (ACCESSING_BITS_0_7 && dino_clock_enabled(clock))
 	{
 		u8 const character = data;
-		if (uart_pulsed(channel))
+		if (pulsed)
 		{
 			m_irda->transmit(character);
 		}
@@ -1591,7 +1607,7 @@ void datarover_state::uart_hold_w(unsigned channel, u32 data, u32 mem_mask)
 		logerror(
 				"UART%c%s TX: %02x %c\n",
 				'A' + channel,
-				uart_pulsed(channel) ? " IrDA" : "",
+				pulsed ? " IrDA" : "",
 				character,
 				(character >= 0x20 && character < 0x7f) ? character : '.');
 		update_irq();
@@ -1635,6 +1651,10 @@ void datarover_state::terminal_key(u8 data)
 template <unsigned Channel>
 void datarover_state::uart_received(u8 data)
 {
+	u32 const clock = Channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	if (!dino_clock_enabled(clock))
+		return;
+
 	if (m_uart_rx_count[Channel] < UART_RX_QUEUE_SIZE)
 	{
 		unsigned const tail =
@@ -2143,7 +2163,8 @@ bool datarover_state::sound_dma_running() const
 {
 	// Sound DMA needs the SIB enabled, its sound channel enabled, and the
 	// direction enable the ROM sets last.
-	return BIT(m_dino[DINO_SIB_CONTROL], 0)
+	return dino_clock_enabled(DINO_CLOCK_SIB)
+			&& BIT(m_dino[DINO_SIB_CONTROL], 0)
 			&& BIT(m_dino[DINO_SIB_CONTROL], 4)
 			&& (m_dino[DINO_SIB_DMA]
 					& (SIB_SOUND_RX_DMA_EN | SIB_SOUND_TX_DMA_EN));
@@ -2153,6 +2174,12 @@ bool datarover_state::sound_dma_running() const
 bool datarover_state::magicbus_powered() const
 {
 	return !(m_dino[DINO_MFIO_DATA_OUTPUT] & DINO_MFIO_MBUS_VCC_OFF);
+}
+
+
+bool datarover_state::dino_clock_enabled(u32 mask) const
+{
+	return bool(m_dino[DINO_MASTER_CLOCK] & mask);
 }
 
 
@@ -2290,7 +2317,8 @@ bool datarover_state::telecom_dma_running() const
 {
 	// kSibEnableTel gates the channel; either direction's DMA enable starts
 	// the transfer, and the two share one pointer in sibDMA.
-	return BIT(m_dino[DINO_SIB_CONTROL], 0)
+	return dino_clock_enabled(DINO_CLOCK_SIB)
+			&& BIT(m_dino[DINO_SIB_CONTROL], 0)
 			&& BIT(m_dino[DINO_SIB_CONTROL], 5)
 			&& (m_dino[DINO_SIB_DMA] & (SIB_TEL_TX_DMA_EN | SIB_TEL_RX_DMA_EN));
 }
@@ -2629,7 +2657,8 @@ TIMER_CALLBACK_MEMBER(datarover_state::telephone_pulse_digit)
 
 void datarover_state::update_sib_timers()
 {
-	bool const sib_enabled = BIT(m_dino[DINO_SIB_CONTROL], 0);
+	bool const sib_enabled = dino_clock_enabled(DINO_CLOCK_SIB)
+			&& BIT(m_dino[DINO_SIB_CONTROL], 0);
 	if (sib_enabled)
 		m_sib_timer->adjust(attotime::from_msec(1), 0, attotime::from_msec(1));
 	else
@@ -2688,7 +2717,9 @@ void datarover_state::update_periodic_timer()
 {
 	u32 const period = m_dino[DINO_PERIODIC_TIMER];
 
-	if (BIT(m_dino[DINO_TIMER_CONTROL], 4) && period)
+	if (dino_clock_enabled(DINO_CLOCK_TIMER)
+			&& BIT(m_dino[DINO_TIMER_CONTROL], 4)
+			&& period)
 	{
 		attotime const interval = attotime::from_ticks(period, 32'768);
 		m_periodic_timer->adjust(interval, 0, interval);
@@ -3404,7 +3435,10 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 		// TestMBReqLine samples this bit before GetPollingCommand fetches a
 		// request record from the attached AT keyboard.
 		return (m_dino[offset] & ~DINO_MBUS_STATUS)
-				| (BIT(m_dino[offset], 0) ? DINO_MBUS_ENABLED_STATUS : 0)
+				| ((BIT(m_dino[offset], 0)
+						&& dino_clock_enabled(DINO_CLOCK_MBUS))
+						? DINO_MBUS_ENABLED_STATUS
+						: 0)
 				| DINO_MBUS_EMPTY_STATUS
 				| (m_magicbus_request ? DINO_MBUS_INT_STATUS : 0);
 
@@ -3481,7 +3515,8 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		u32 const irq = m_dino[offset] & 0x8000'0000;
 		COMBINE_DATA(&m_dino[offset]);
 		m_dino[offset] = (m_dino[offset] & ~0x8000'0000) | irq;
-		if (BIT(m_dino[offset], 0))
+		if (BIT(m_dino[offset], 0)
+				&& dino_clock_enabled(DINO_CLOCK_MBUS))
 		{
 			m_dino[DINO_INTERRUPT1] |= 0x0000'0180;
 			if (BIT(m_dino[offset], 4))
@@ -3561,7 +3596,7 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 
 	case DINO_MBUS_COMMAND:
 		COMBINE_DATA(&m_dino[offset]);
-		if (ACCESSING_BITS_0_15)
+		if (ACCESSING_BITS_0_15 && dino_clock_enabled(DINO_CLOCK_MBUS))
 		{
 			u16 const command = m_dino[offset];
 			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT | INT2_MBUS_EMPTY;
@@ -3638,6 +3673,26 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		COMBINE_DATA(&m_dino[offset]);
 		update_rtc_timers();
 		break;
+
+	case DINO_MASTER_CLOCK:
+	{
+		u32 const old_clock = m_dino[offset];
+		COMBINE_DATA(&m_dino[offset]);
+
+		update_periodic_timer();
+		update_sib_timers();
+
+		if (!(old_clock & DINO_CLOCK_MBUS)
+				&& dino_clock_enabled(DINO_CLOCK_MBUS)
+				&& BIT(m_dino[DINO_MBUS_CONTROL1], 0))
+		{
+			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT;
+			if (m_magicbus_response != MBUS_RESPONSE_NONE)
+				magicbus_deliver_response();
+			magicbus_accept_host_data();
+		}
+		break;
+	}
 
 	case DINO_POWER_CONTROL:
 	{
