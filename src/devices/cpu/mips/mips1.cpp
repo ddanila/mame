@@ -219,6 +219,10 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_cpurev(cpurev)
 	, m_endianness(ENDIANNESS_BIG)
 	, m_multiply_to_gpr(multiply_to_gpr)
+	, m_divide_hi(0)
+	, m_divide_lo(0)
+	, m_divide_cycles(0)
+	, m_multiply_gpr_delay(0)
 	, m_icount(0)
 	, m_icache(icache_size)
 	, m_dcache(dcache_size, dcache_ways)
@@ -343,6 +347,10 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_pc));
 	save_item(NAME(m_hi));
 	save_item(NAME(m_lo));
+	save_item(NAME(m_divide_hi));
+	save_item(NAME(m_divide_lo));
+	save_item(NAME(m_divide_cycles));
+	save_item(NAME(m_multiply_gpr_delay));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -398,6 +406,8 @@ void mips1core_device_base::device_reset()
 	// initialize the state
 	m_pc = 0xbfc00000;
 	m_branch_state = NONE;
+	m_divide_cycles = 0;
+	m_multiply_gpr_delay = 0;
 	m_icache.reset();
 	m_dcache.reset();
 
@@ -420,11 +430,14 @@ void mips1core_device_base::execute_run()
 	// core execution loop
 	while (m_icount-- > 0)
 	{
+		int const cycle_start = m_icount;
+		bool divide_started = false;
+
 		// debugging
 		debugger_instruction_hook(m_pc);
 
 		// fetch instruction
-		fetch(m_pc, [this](u32 const op)
+		fetch(m_pc, [this, &divide_started](u32 const op)
 		{
 			// check for interrupts
 			if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
@@ -441,6 +454,12 @@ void mips1core_device_base::execute_run()
 				generate_exception(EXCEPTION_INTERRUPT);
 				return;
 			}
+
+			// A three-operand TX39 multiply writes its GPR one pipeline stage
+			// later.  Only an immediately following dependent instruction
+			// stalls; independent instructions and HI/LO consumers continue
+			// at one instruction per cycle.
+			multiply_gpr_interlock(op);
 
 			// decode and execute instruction
 			switch (op >> 26)
@@ -482,15 +501,19 @@ void mips1core_device_base::execute_run()
 					generate_exception(EXCEPTION_BREAK);
 					break;
 				case 0x10: // MFHI
+					divide_interlock();
 					m_r[RDREG] = m_hi;
 					break;
 				case 0x11: // MTHI
+					cancel_divide();
 					m_hi = m_r[RSREG];
 					break;
 				case 0x12: // MFLO
+					divide_interlock();
 					m_r[RDREG] = m_lo;
 					break;
 				case 0x13: // MTLO
+					cancel_divide();
 					m_lo = m_r[RSREG];
 					break;
 				case 0x18: // MULT
@@ -502,7 +525,7 @@ void mips1core_device_base::execute_run()
 						if (m_multiply_to_gpr)
 						{
 							m_r[RDREG] = m_lo;
-							m_icount--;
+							set_multiply_gpr_delay(RDREG);
 						}
 						else
 							m_icount -= 11;
@@ -517,27 +540,70 @@ void mips1core_device_base::execute_run()
 						if (m_multiply_to_gpr)
 						{
 							m_r[RDREG] = m_lo;
-							m_icount--;
+							set_multiply_gpr_delay(RDREG);
 						}
 						else
 							m_icount -= 11;
 					}
 					break;
 				case 0x1a: // DIV
-					if (m_r[RTREG])
+					if (m_multiply_to_gpr)
 					{
-						m_lo = s32(m_r[RSREG]) / s32(m_r[RTREG]);
-						m_hi = s32(m_r[RSREG]) % s32(m_r[RTREG]);
+						cancel_divide();
+						m_divide_lo = m_lo;
+						m_divide_hi = m_hi;
+						if (m_r[RTREG])
+						{
+							if (m_r[RSREG] == 0x8000'0000U
+									&& m_r[RTREG] == 0xffff'ffffU)
+							{
+								m_divide_lo = 0x8000'0000U;
+								m_divide_hi = 0;
+							}
+							else
+							{
+								m_divide_lo =
+										s32(m_r[RSREG]) / s32(m_r[RTREG]);
+								m_divide_hi =
+										s32(m_r[RSREG]) % s32(m_r[RTREG]);
+							}
+						}
+						m_divide_cycles = 35;
+						divide_started = true;
 					}
-					m_icount -= 34;
+					else
+					{
+						if (m_r[RTREG])
+						{
+							m_lo = s32(m_r[RSREG]) / s32(m_r[RTREG]);
+							m_hi = s32(m_r[RSREG]) % s32(m_r[RTREG]);
+						}
+						m_icount -= 34;
+					}
 					break;
 				case 0x1b: // DIVU
-					if (m_r[RTREG])
+					if (m_multiply_to_gpr)
 					{
-						m_lo = m_r[RSREG] / m_r[RTREG];
-						m_hi = m_r[RSREG] % m_r[RTREG];
+						cancel_divide();
+						m_divide_lo = m_lo;
+						m_divide_hi = m_hi;
+						if (m_r[RTREG])
+						{
+							m_divide_lo = m_r[RSREG] / m_r[RTREG];
+							m_divide_hi = m_r[RSREG] % m_r[RTREG];
+						}
+						m_divide_cycles = 35;
+						divide_started = true;
 					}
-					m_icount -= 34;
+					else
+					{
+						if (m_r[RTREG])
+						{
+							m_lo = m_r[RSREG] / m_r[RTREG];
+							m_hi = m_r[RSREG] % m_r[RTREG];
+						}
+						m_icount -= 34;
+					}
 					break;
 				case 0x20: // ADD
 					{
@@ -813,6 +879,14 @@ void mips1core_device_base::execute_run()
 			m_branch_state = NONE;
 			break;
 		}
+
+		// The R3900 divider runs beside the integer pipeline.  Account for
+		// every elapsed core cycle, including another pipeline interlock, but
+		// only the issue cycle when this instruction started a new divide.
+		advance_divide(
+				divide_started
+						? 1U
+						: 1U + unsigned(cycle_start - m_icount));
 	}
 }
 
@@ -1006,6 +1080,154 @@ void r3900_device::invalidate_data_cache(u32 address, u32 bytes)
 	}
 }
 
+bool mips1core_device_base::reads_gpr(u32 const op, unsigned const reg) const
+{
+	if (!reg)
+		return false;
+
+	unsigned const rs = BIT(op, 21, 5);
+	unsigned const rt = BIT(op, 16, 5);
+	auto const reads_rs = [reg, rs]() { return rs == reg; };
+	auto const reads_rt = [reg, rt]() { return rt == reg; };
+
+	switch (op >> 26)
+	{
+	case 0x00: // SPECIAL
+		switch (op & 63)
+		{
+		case 0x00: // SLL
+		case 0x02: // SRL
+		case 0x03: // SRA
+			return reads_rt();
+
+		case 0x04: // SLLV
+		case 0x06: // SRLV
+		case 0x07: // SRAV
+		case 0x18: // MULT
+		case 0x19: // MULTU
+		case 0x1a: // DIV
+		case 0x1b: // DIVU
+		case 0x20: // ADD
+		case 0x21: // ADDU
+		case 0x22: // SUB
+		case 0x23: // SUBU
+		case 0x24: // AND
+		case 0x25: // OR
+		case 0x26: // XOR
+		case 0x27: // NOR
+		case 0x2a: // SLT
+		case 0x2b: // SLTU
+			return reads_rs() || reads_rt();
+
+		case 0x08: // JR
+		case 0x09: // JALR
+		case 0x11: // MTHI
+		case 0x13: // MTLO
+			return reads_rs();
+
+		default:
+			return false;
+		}
+
+	case 0x01: // REGIMM
+	case 0x06: // BLEZ
+	case 0x07: // BGTZ
+	case 0x08: // ADDI
+	case 0x09: // ADDIU
+	case 0x0a: // SLTI
+	case 0x0b: // SLTIU
+	case 0x0c: // ANDI
+	case 0x0d: // ORI
+	case 0x0e: // XORI
+		return reads_rs();
+
+	case 0x04: // BEQ
+	case 0x05: // BNE
+	case 0x1c: // R3900 MADD/MADDU
+		return reads_rs() || reads_rt();
+
+	case 0x10: // COP0
+	case 0x11: // COP1
+	case 0x12: // COP2
+	case 0x13: // COP3
+		// Move/control-to-coprocessor instructions source a GPR in rt.
+		return (rs == 0x04 || rs == 0x06) && reads_rt();
+
+	case 0x20: // LB
+	case 0x21: // LH
+	case 0x22: // LWL
+	case 0x23: // LW
+	case 0x24: // LBU
+	case 0x25: // LHU
+	case 0x26: // LWR
+	case 0x2f: // CACHE
+	case 0x31: // LWC1
+	case 0x32: // LWC2
+	case 0x33: // LWC3
+	case 0x39: // SWC1
+	case 0x3a: // SWC2
+	case 0x3b: // SWC3
+		return reads_rs();
+
+	case 0x28: // SB
+	case 0x29: // SH
+	case 0x2a: // SWL
+	case 0x2b: // SW
+	case 0x2e: // SWR
+		return reads_rs() || reads_rt();
+
+	default:
+		return false;
+	}
+}
+
+void mips1core_device_base::multiply_gpr_interlock(u32 const op)
+{
+	if (m_multiply_gpr_delay && reads_gpr(op, m_multiply_gpr_delay))
+		m_icount--;
+
+	m_multiply_gpr_delay = 0;
+}
+
+void mips1core_device_base::set_multiply_gpr_delay(unsigned const reg)
+{
+	if (m_multiply_to_gpr)
+		m_multiply_gpr_delay = reg;
+}
+
+void mips1core_device_base::cancel_divide()
+{
+	if (m_multiply_to_gpr)
+		m_divide_cycles = 0;
+}
+
+void mips1core_device_base::divide_interlock()
+{
+	if (!m_divide_cycles)
+		return;
+
+	m_icount -= m_divide_cycles;
+	m_hi = m_divide_hi;
+	m_lo = m_divide_lo;
+	m_divide_cycles = 0;
+}
+
+void mips1core_device_base::advance_divide(unsigned const cycles)
+{
+	if (!m_divide_cycles)
+		return;
+
+	if (cycles < m_divide_cycles)
+	{
+		m_divide_cycles -= cycles;
+		return;
+	}
+
+	m_hi = m_divide_hi;
+	m_lo = m_divide_lo;
+	m_divide_cycles = 0;
+}
+
 bool r3900_device::cache_store_allocate() const
 {
 	// The R3900 data cache is write-through without write allocation.
@@ -1080,7 +1302,6 @@ void r3900_device::handle_special2(u32 const op)
 		return;
 	}
 
-	u64 const accumulator = (u64(m_hi) << 32) | m_lo;
 	u64 product;
 
 	switch (op & 63)
@@ -1098,13 +1319,17 @@ void r3900_device::handle_special2(u32 const op)
 		return;
 	}
 
+	// MADD and MADDU read HI:LO, so they interlock only while an independent
+	// divide is still producing that accumulator.
+	divide_interlock();
+
+	u64 const accumulator = (u64(m_hi) << 32) | m_lo;
 	u64 const result = accumulator + product;
 	m_lo = u32(result);
 	m_hi = u32(result >> 32);
 	m_r[RDREG] = m_lo;
 
-	// TX39 MADD/MADDU use the two-stage multiply/add execution unit.
-	m_icount--;
+	set_multiply_gpr_delay(RDREG);
 }
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
@@ -1114,6 +1339,11 @@ std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembl
 
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
+	// An exception flushes the integer pipeline.  A TX39 divide continues in
+	// its independent unit, but a one-cycle multiply-to-GPR dependency does
+	// not carry into the exception handler.
+	m_multiply_gpr_delay = 0;
+
 	// set the exception PC
 	m_cop0[COP0_EPC] = m_pc;
 
