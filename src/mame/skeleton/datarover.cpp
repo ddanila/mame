@@ -3260,6 +3260,13 @@ void datarover_state::magicbus_deliver_response()
 
 	std::array<u8, 88> response{};
 	unsigned response_size = 0;
+	auto const put_be32 = [&response](unsigned offset, u32 value)
+	{
+		response[offset] = value >> 24;
+		response[offset + 1] = value >> 16;
+		response[offset + 2] = value >> 8;
+		response[offset + 3] = value;
+	};
 
 	switch (m_magicbus_response)
 	{
@@ -3277,13 +3284,6 @@ void datarover_state::magicbus_deliver_response()
 		{
 			response[offset] = value >> 8;
 			response[offset + 1] = value;
-		};
-		auto const put_be32 = [&response](unsigned offset, u32 value)
-		{
-			response[offset] = value >> 24;
-			response[offset + 1] = value >> 16;
-			response[offset + 2] = value >> 8;
-			response[offset + 3] = value;
 		};
 
 		// MagicbusPeripheralInfo, reconstructed from the SDK ELF's retained
@@ -3322,7 +3322,7 @@ void datarover_state::magicbus_deliver_response()
 		// The monitor routes SCTG kinds 18 and 19 to GetDataFunction and
 		// SendDataFunction respectively.
 		bool const scsi = magicbus_endpoint_is_scsi(endpoint);
-		response[0] = scsi ? 4 : 0; // SCTG length in 32-bit words
+		response[0] = scsi ? 6 : 0; // SCTG length in 32-bit words
 		response[1] = scsi
 				? (m_magicbus_scsi_read_pending ? 18 : 19)
 				: 14;
@@ -3352,10 +3352,14 @@ void datarover_state::magicbus_deliver_response()
 	}
 
 	case MBUS_RESPONSE_SCSI:
-		// A harmless, aligned 16-byte monitor command.  Function zero is
-		// deliberately unsupported, so GetDataFunction acknowledges receipt
-		// without reading or modifying target memory.
-		response_size = 16;
+		// Exercise the monitor's safe FastChecksum command against the first
+		// four words of mBusBuffer itself.  The result is returned at byte 20
+		// when the peer subsequently requests SendDataFunction.
+		response[0] = 0x80;
+		put_be32(4, 0x0000'b280); // address of mBusBuffer
+		put_be32(8, 16);          // bytes to sum
+		put_be32(16, 0x1234'5678); // initial sum
+		response_size = 24;
 		m_magicbus_scsi_read_pending = false;
 		request_after_data = m_magicbus_scsi_requests != 0;
 		break;
@@ -3447,7 +3451,16 @@ void datarover_state::magicbus_accept_host_data()
 	}
 	else if (magicbus_endpoint_is_scsi(endpoint))
 	{
-		logerror("Magic Bus SCTG accepted %u host bytes\n", count);
+		u8 const command = count ? space.read_byte(start) : 0;
+		u8 const status = count > 2 ? space.read_byte(start + 2) : 0xff;
+		u32 const result = count >= 24 ? space.read_dword(start + 20) : 0;
+		logerror(
+				"Magic Bus SCTG accepted %u host bytes, "
+				"command=%02x status=%u result=%08x\n",
+				count,
+				command,
+				status,
+				result);
 		// SendDataFunction uses command 7 to transfer a monitor/PCLink
 		// transport buffer to the target.  The target consumes the complete
 		// DMA record; interpreting that higher-level payload belongs to the
