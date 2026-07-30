@@ -961,6 +961,18 @@ bool r3900_device::cache_auto_lock(bool icache) const
 	return !icache && BIT(m_cop0[COP0_Cache], 8);
 }
 
+unsigned r3900_device::cache_refill_words(bool icache) const
+{
+	if (icache)
+		return 4U << BIT(m_cop0[COP0_Config], 2, 2);
+
+	// DCBR clear selects the data cache's native one-word line. Otherwise
+	// DRSize encodes 4, 8, 16, or 32 words.
+	return BIT(m_cop0[COP0_Config], 6)
+			? 4U << BIT(m_cop0[COP0_Config], 0, 2)
+			: 1U;
+}
+
 bool r3900_device::cache_store_allocate() const
 {
 	// The R3900 data cache is write-through without write allocation.
@@ -1228,6 +1240,11 @@ bool mips1core_device_base::cache_auto_lock(bool icache) const
 	return false;
 }
 
+unsigned mips1core_device_base::cache_refill_words(bool icache) const
+{
+	return 1;
+}
+
 bool mips1core_device_base::cache_store_allocate() const
 {
 	return true;
@@ -1357,7 +1374,8 @@ void mips1core_device_base::swr(u32 const op)
  *
  * The function returns the selected line and the miss state.
  *
- * TODO: multiple-word cache lines
+ * Cache backing remains word-granular. Devices may refill several consecutive
+ * words for one miss while retaining this per-word lookup and tag model.
  */
 std::tuple<struct mips1core_device_base::cache::line &, bool> mips1core_device_base::cache_lookup(u32 address, bool invalidate, bool icache)
 {
@@ -1460,6 +1478,32 @@ void mips1core_device_base::cache_lock(u32 address, bool icache)
 	}
 }
 
+bool mips1core_device_base::cache_refill(u32 address, bool icache)
+{
+	unsigned const words = cache_refill_words(icache);
+	u32 const start = address & ~(words * 4 - 1);
+
+	for (unsigned word = 0; word < words; ++word)
+	{
+		u32 const refill_address = start + word * 4;
+		struct cache::line &line =
+				std::get<0>(cache_lookup(refill_address, true, icache));
+		u32 const data = space(AS_PROGRAM).read_dword(refill_address);
+		if (m_bus_error)
+		{
+			m_bus_error = false;
+			generate_exception(
+					icache ? EXCEPTION_BUSINST : EXCEPTION_BUSDATA);
+			return false;
+		}
+
+		line.update(data);
+		cache_lock(refill_address, icache);
+	}
+
+	return true;
+}
+
 // compute bit position of sub-unit within a word given endianness and address
 template <typename T>
 unsigned mips1core_device_base::shift_factor(u32 address) const
@@ -1499,18 +1543,8 @@ std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> mi
 
 			if (miss)
 			{
-				// load
-				u32 const data = space(AS_PROGRAM).read_dword(address);
-				if (m_bus_error)
-				{
-					m_bus_error = false;
-					generate_exception(EXCEPTION_BUSDATA);
-
+				if (!cache_refill(address, false))
 					return;
-				}
-
-				// replace cache line data and mark valid
-				l.update(data);
 			}
 
 			data = l.data >> shift_factor<T>(address);
@@ -1657,18 +1691,8 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 
 		if (miss)
 		{
-			// fetch
-			u32 const data = space(AS_PROGRAM).read_dword(address);
-			if (m_bus_error)
-			{
-				m_bus_error = false;
-				generate_exception(EXCEPTION_BUSINST);
-
+			if (!cache_refill(address, true))
 				return;
-			}
-
-			// replace cache line data and mark valid
-			l.update(data);
 		}
 
 		data = l.data;
