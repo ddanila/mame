@@ -872,6 +872,7 @@ public:
 	INPUT_CHANGED_MEMBER(main_battery_changed);
 	INPUT_CHANGED_MEMBER(battery_cover_changed);
 	INPUT_CHANGED_MEMBER(irda_carrier_changed);
+	INPUT_CHANGED_MEMBER(magicbus_accessory_changed);
 	INPUT_CHANGED_MEMBER(magicbus_scsi_request_changed);
 
 protected:
@@ -969,6 +970,7 @@ private:
 
 	// interrupt2 Magic Bus bits, from Dino.asm.h.
 	static constexpr u32 INT2_MBUS_TRANSMIT = 0x0000'0800; // kIntMbusTransmitMask
+	static constexpr u32 INT2_MBUS_RX_ERROR = 0x0000'0080; // kIntMbusRxErrMask
 	static constexpr u32 INT2_MBUS_EMPTY = 0x0000'0200;    // kIntMbusEmptyMask
 	static constexpr u32 INT2_MBUS_RECEIVE = 0x0000'0100;  // kIntMbusReceiveMask
 	static constexpr u32 INT2_MBUS_COMMAND = 0x0000'0040;  // kIntMbusDetMask
@@ -1114,10 +1116,12 @@ private:
 	bool magicbus_endpoint_present(unsigned endpoint) const;
 	bool magicbus_endpoint_is_keyboard(unsigned endpoint) const;
 	bool magicbus_endpoint_is_scsi(unsigned endpoint) const;
+	u8 magicbus_endpoint_kind(unsigned configuration, unsigned endpoint) const;
+	void magicbus_reset_endpoint(unsigned endpoint);
 	void magicbus_drive_request(bool asserted);
 	void magicbus_update_request();
 	void magicbus_set_request(unsigned endpoint, bool asserted);
-	void magicbus_command(u16 command);
+	bool magicbus_command(u16 command);
 	void magicbus_deliver_response();
 	void magicbus_accept_host_data();
 	bool dino_clock_enabled(u32 mask) const;
@@ -1153,6 +1157,7 @@ private:
 	TIMER_CALLBACK_MEMBER(phone_ring_tick);
 	TIMER_CALLBACK_MEMBER(sound_tick);
 	TIMER_CALLBACK_MEMBER(magicbus_keyboard_tick);
+	TIMER_CALLBACK_MEMBER(magicbus_topology_settled);
 	TIMER_CALLBACK_MEMBER(battery_charge_tick);
 	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 
@@ -1244,7 +1249,16 @@ private:
 	u64 m_telephone_pulse_break_start = 0;
 	bool m_telephone_pulse_break = false;
 	static constexpr unsigned MAGICBUS_ENDPOINTS = 2;
+	static constexpr u8 MAGICBUS_TOPOLOGY_IDLE = 0;
+	static constexpr u8 MAGICBUS_TOPOLOGY_ADD_TAIL = 1;
+	static constexpr u8 MAGICBUS_TOPOLOGY_REMOVE = 2;
+	static constexpr u8 MAGICBUS_TOPOLOGY_PULSE = 3;
+	u8 m_magicbus_configuration = 1;
+	u8 m_magicbus_pending_configuration = 1;
+	u8 m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+	s8 m_magicbus_detached_address = -1;
 	bool m_magicbus_request = false;
+	bool m_magicbus_topology_request = false;
 	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_endpoint_request{};
 	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_assigned{};
 	std::array<u8, MAGICBUS_ENDPOINTS> m_magicbus_address{};
@@ -1275,6 +1289,7 @@ private:
 	emu_timer *m_phone_ring_timer = nullptr;
 	emu_timer *m_sound_timer = nullptr;
 	emu_timer *m_magicbus_keyboard_timer = nullptr;
+	emu_timer *m_magicbus_topology_timer = nullptr;
 	emu_timer *m_battery_charge_timer = nullptr;
 };
 
@@ -2249,6 +2264,114 @@ INPUT_CHANGED_MEMBER(datarover_state::irda_carrier_changed)
 }
 
 
+INPUT_CHANGED_MEMBER(datarover_state::magicbus_accessory_changed)
+{
+	u8 const desired = newval & 0x03;
+	u8 const current = m_magicbus_configuration;
+	m_magicbus_pending_configuration = desired;
+
+	// Configuration files are loaded before the emulated machine is live.
+	// machine_reset() will establish the selected chain without synthesizing
+	// a connector edge.
+	if (!m_magicbus_topology_timer)
+	{
+		m_magicbus_configuration = desired;
+		return;
+	}
+
+	// Reversing an uncommitted tail insertion removes the topology request
+	// before the old tail has been converted to a mid-peripheral.
+	if (desired == current)
+	{
+		m_magicbus_topology_timer->reset();
+		m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+		m_magicbus_topology_request = false;
+		magicbus_update_request();
+		return;
+	}
+
+	unsigned old_count = 0;
+	unsigned new_count = 0;
+	while (old_count < MAGICBUS_ENDPOINTS
+			&& magicbus_endpoint_kind(current, old_count))
+		++old_count;
+	while (new_count < MAGICBUS_ENDPOINTS
+			&& magicbus_endpoint_kind(desired, new_count))
+		++new_count;
+
+	bool tail_add = new_count > old_count;
+	for (unsigned endpoint = 0; endpoint < old_count && tail_add; ++endpoint)
+		tail_add = magicbus_endpoint_kind(current, endpoint)
+				== magicbus_endpoint_kind(desired, endpoint);
+
+	m_magicbus_detached_address = -1;
+	for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+	{
+		if (magicbus_endpoint_kind(current, endpoint)
+				!= magicbus_endpoint_kind(desired, endpoint))
+		{
+			if (magicbus_endpoint_kind(current, endpoint)
+					&& m_magicbus_assigned[endpoint]
+					&& m_magicbus_detached_address < 0)
+				m_magicbus_detached_address = m_magicbus_address[endpoint];
+			magicbus_reset_endpoint(endpoint);
+		}
+	}
+
+	// A physical topology change aborts an in-flight controller transaction.
+	// Unchanged, already assigned endpoints otherwise retain their address.
+	m_magicbus_response = MBUS_RESPONSE_NONE;
+	m_magicbus_response_endpoint = -1;
+	m_magicbus_host_data_endpoint = -1;
+	m_magicbus_scsi_read_pending = false;
+	m_magicbus_scsi_write_pending = false;
+	m_magicbus_scsi_requests = 0;
+	m_magicbus_scsi_request_armed = 0;
+
+	if (!magicbus_powered())
+	{
+		m_magicbus_configuration = desired;
+		m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+		m_magicbus_detached_address = -1;
+		m_magicbus_topology_request = false;
+		magicbus_update_request();
+		return;
+	}
+
+	if (tail_add && old_count)
+	{
+		// The newly connected tail remains behind the old tail's closed
+		// downstream buffers.  Its connector interrupt is visible, but the
+		// endpoint itself becomes addressable only after command Assign-Mid.
+		m_magicbus_topology_change = MAGICBUS_TOPOLOGY_ADD_TAIL;
+		m_magicbus_topology_request = true;
+		magicbus_update_request();
+		return;
+	}
+
+	m_magicbus_configuration = desired;
+	if (m_magicbus_detached_address >= 0)
+	{
+		// The upstream MBIC remembers which assigned downstream position
+		// disappeared.  It holds the connector request until address polling
+		// reaches that position; the following request read then receives no
+		// response and lets the ROM classify a detachment.
+		m_magicbus_topology_change = MAGICBUS_TOPOLOGY_REMOVE;
+		m_magicbus_topology_request = true;
+		magicbus_update_request();
+		return;
+	}
+
+	// Attachment to an empty chain uses a short connector-settle pulse; the
+	// ROM starts its own one-second debounce on the release edge before it
+	// powers and enumerates the new bus.
+	m_magicbus_topology_change = MAGICBUS_TOPOLOGY_PULSE;
+	m_magicbus_topology_request = true;
+	magicbus_update_request();
+	m_magicbus_topology_timer->adjust(attotime::from_msec(10));
+}
+
+
 INPUT_CHANGED_MEMBER(datarover_state::magicbus_scsi_request_changed)
 {
 	if (!newval)
@@ -3113,33 +3236,54 @@ TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 }
 
 
+u8 datarover_state::magicbus_endpoint_kind(
+		unsigned configuration,
+		unsigned endpoint) const
+{
+	if (endpoint == 0)
+		return configuration == 0 ? 0 : configuration == 3 ? 2 : 1;
+	if (endpoint == 1)
+		return configuration == 2 ? 2 : 0;
+	return 0;
+}
+
+
 bool datarover_state::magicbus_endpoint_present(unsigned endpoint) const
 {
-	unsigned const configuration = m_magicbus_accessory->read() & 0x03;
-	return endpoint == 0
-			? configuration != 0
-			: endpoint == 1 && configuration == 2;
+	return magicbus_endpoint_kind(m_magicbus_configuration, endpoint) != 0;
 }
 
 
 bool datarover_state::magicbus_endpoint_is_keyboard(unsigned endpoint) const
 {
-	return endpoint == 0
-			&& magicbus_endpoint_present(endpoint)
-			&& (m_magicbus_accessory->read() & 0x03) != 3;
+	return magicbus_endpoint_kind(m_magicbus_configuration, endpoint) == 1;
 }
 
 
 bool datarover_state::magicbus_endpoint_is_scsi(unsigned endpoint) const
 {
-	return magicbus_endpoint_present(endpoint)
-			&& !magicbus_endpoint_is_keyboard(endpoint);
+	return magicbus_endpoint_kind(m_magicbus_configuration, endpoint) == 2;
+}
+
+
+void datarover_state::magicbus_reset_endpoint(unsigned endpoint)
+{
+	if (endpoint >= MAGICBUS_ENDPOINTS)
+		return;
+
+	m_magicbus_endpoint_request[endpoint] = false;
+	m_magicbus_assigned[endpoint] = false;
+	m_magicbus_address[endpoint] = 0xff;
+	m_magicbus_info_page[endpoint] = 0;
+	m_magicbus_keyboard_read_pending[endpoint] = false;
+	m_magicbus_key_head[endpoint] = 0;
+	m_magicbus_key_count[endpoint] = 0;
 }
 
 
 void datarover_state::magicbus_update_request()
 {
-	bool asserted = false;
+	bool asserted = magicbus_powered() && m_magicbus_topology_request;
 	if (magicbus_powered())
 	{
 		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
@@ -3215,6 +3359,15 @@ TIMER_CALLBACK_MEMBER(datarover_state::magicbus_keyboard_tick)
 }
 
 
+TIMER_CALLBACK_MEMBER(datarover_state::magicbus_topology_settled)
+{
+	m_magicbus_topology_request = false;
+	if (m_magicbus_topology_change == MAGICBUS_TOPOLOGY_PULSE)
+		m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+	magicbus_update_request();
+}
+
+
 TIMER_CALLBACK_MEMBER(datarover_state::battery_charge_tick)
 {
 	// The input-port choices are calibrated test levels, not a chemistry
@@ -3226,7 +3379,7 @@ TIMER_CALLBACK_MEMBER(datarover_state::battery_charge_tick)
 }
 
 
-void datarover_state::magicbus_command(u16 command)
+bool datarover_state::magicbus_command(u16 command)
 {
 	if (!magicbus_powered())
 	{
@@ -3239,7 +3392,7 @@ void datarover_state::magicbus_command(u16 command)
 		m_magicbus_scsi_requests = 0;
 		m_magicbus_endpoint_request.fill(false);
 		magicbus_update_request();
-		return;
+		return true;
 	}
 
 	// Wire command words are the SDK's command-table entry XORed with the
@@ -3275,7 +3428,7 @@ void datarover_state::magicbus_command(u16 command)
 		}
 	}
 	if (decoded_command < 0)
-		return;
+		return true;
 
 	auto const endpoint_for_address = [this](unsigned address) -> int
 	{
@@ -3312,7 +3465,7 @@ void datarover_state::magicbus_command(u16 command)
 					&& !m_magicbus_assigned[endpoint])
 				magicbus_set_request(endpoint, true);
 		}
-		return;
+		return true;
 	}
 
 	if (decoded_command == 24 && decoded_address < 6)
@@ -3329,10 +3482,40 @@ void datarover_state::magicbus_command(u16 command)
 				break;
 			}
 		}
-		return;
+		return true;
 	}
 
 	int const endpoint = endpoint_for_address(decoded_address);
+	if (decoded_command == 27)
+	{
+		if (endpoint >= 0
+				&& m_magicbus_topology_change == MAGICBUS_TOPOLOGY_ADD_TAIL)
+		{
+			u8 const old_configuration = m_magicbus_configuration;
+			m_magicbus_configuration = m_magicbus_pending_configuration;
+			m_magicbus_topology_request = false;
+			m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+
+			// Assign-Mid opens the former tail's downstream buffers.  Every
+			// newly reachable endpoint is still unassigned and owns the
+			// request line until address assignment consumes it.
+			for (unsigned candidate = 0;
+					candidate < MAGICBUS_ENDPOINTS;
+					++candidate)
+			{
+				if (!magicbus_endpoint_kind(old_configuration, candidate)
+						&& magicbus_endpoint_present(candidate))
+					m_magicbus_endpoint_request[candidate] = true;
+			}
+
+			// Assign-Mid exposes the downstream wires but does not select the
+			// unassigned endpoint.  Apollo requires MBReq low here; its next
+			// address-six IRQ poll opens that endpoint's request window.
+			magicbus_drive_request(false);
+		}
+		return true;
+	}
+
 	if (decoded_command == 28)
 	{
 		// Request polling is address-multiplexed on the physical shared
@@ -3340,13 +3523,46 @@ void datarover_state::magicbus_command(u16 command)
 		// only the selected endpoint's level visible to the controller.
 		if (decoded_address == 7)
 			magicbus_update_request();
+		else if (decoded_address == 6)
+		{
+			bool unassigned_request = false;
+			for (unsigned candidate = 0;
+					candidate < MAGICBUS_ENDPOINTS;
+					++candidate)
+			{
+				unassigned_request |= magicbus_endpoint_present(candidate)
+						&& !m_magicbus_assigned[candidate]
+						&& m_magicbus_endpoint_request[candidate];
+			}
+			magicbus_drive_request(unassigned_request);
+		}
+		else if (m_magicbus_topology_change == MAGICBUS_TOPOLOGY_REMOVE
+				&& decoded_address == m_magicbus_detached_address)
+			magicbus_drive_request(true);
 		else
 			magicbus_drive_request(endpoint >= 0
 					&& m_magicbus_endpoint_request[endpoint]);
-		return;
+		return true;
 	}
 	if (endpoint < 0)
-		return;
+	{
+		if (decoded_command == 1
+				&& m_magicbus_topology_change == MAGICBUS_TOPOLOGY_REMOVE
+				&& decoded_address == m_magicbus_detached_address)
+		{
+			// The upstream MBIC can announce the broken downstream position,
+			// but the removed peripheral cannot answer IRQ-Get.  Dino reports
+			// the receive failure instead of a successful command completion;
+			// the ROM converts that failed polling completion into its
+			// HandleDetachedPeripherals path before recovering the bus.
+			m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+			m_magicbus_detached_address = -1;
+			m_magicbus_topology_request = false;
+			magicbus_drive_request(false);
+			return false;
+		}
+		return true;
+	}
 
 	switch (decoded_command)
 	{
@@ -3426,6 +3642,8 @@ void datarover_state::magicbus_command(u16 command)
 	default:
 		break;
 	}
+
+	return true;
 }
 
 
@@ -3572,7 +3790,7 @@ void datarover_state::magicbus_deliver_response()
 
 	unsigned const requested =
 			(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
-	if (requested > 4 || BIT(m_dino[DINO_MBUS_CONTROL1], 16))
+	if (response_size > 4 || BIT(m_dino[DINO_MBUS_CONTROL1], 16))
 	{
 		address_space &space = m_maincpu->space(AS_PROGRAM);
 		u32 const start = m_dino[DINO_MBUS_DMA_START] & 0x1fff'fffc;
@@ -3916,8 +4134,10 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		if (ACCESSING_BITS_0_15 && dino_clock_enabled(DINO_CLOCK_MBUS))
 		{
 			u16 const command = m_dino[offset];
-			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT | INT2_MBUS_EMPTY;
-			magicbus_command(command);
+			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_TRANSMIT;
+			m_dino[DINO_INTERRUPT2] |= magicbus_command(command)
+					? INT2_MBUS_EMPTY
+					: INT2_MBUS_RX_ERROR;
 		}
 		break;
 
@@ -3989,6 +4209,11 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		{
 			// Removing accessory power loses its address and pending
 			// transaction.  A later broadcast FIND discovers it afresh.
+			m_magicbus_topology_timer->reset();
+			m_magicbus_configuration = m_magicbus_pending_configuration;
+			m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+			m_magicbus_detached_address = -1;
+			m_magicbus_topology_request = false;
 			m_magicbus_assigned.fill(false);
 			m_magicbus_address.fill(0xff);
 			m_magicbus_info_page.fill(0);
@@ -4207,6 +4432,8 @@ void datarover_state::machine_start()
 			timer_alloc(FUNC(datarover_state::phone_ring_tick), this);
 	m_magicbus_keyboard_timer =
 			timer_alloc(FUNC(datarover_state::magicbus_keyboard_tick), this);
+	m_magicbus_topology_timer =
+			timer_alloc(FUNC(datarover_state::magicbus_topology_settled), this);
 	m_battery_charge_timer =
 			timer_alloc(FUNC(datarover_state::battery_charge_tick), this);
 	m_rtc_nvram->set_base(m_rtc_nvram_data.data(), sizeof(m_rtc_nvram_data));
@@ -4257,7 +4484,12 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telephone_pulse_count));
 	save_item(NAME(m_telephone_pulse_break_start));
 	save_item(NAME(m_telephone_pulse_break));
+	save_item(NAME(m_magicbus_configuration));
+	save_item(NAME(m_magicbus_pending_configuration));
+	save_item(NAME(m_magicbus_topology_change));
+	save_item(NAME(m_magicbus_detached_address));
 	save_item(NAME(m_magicbus_request));
+	save_item(NAME(m_magicbus_topology_request));
 	save_item(NAME(m_magicbus_endpoint_request));
 	save_item(NAME(m_magicbus_assigned));
 	save_item(NAME(m_magicbus_address));
@@ -4347,7 +4579,13 @@ void datarover_state::machine_reset()
 	m_telephone_pulse_count = 0;
 	m_telephone_pulse_break_start = 0;
 	m_telephone_pulse_break = false;
+	m_magicbus_configuration = m_magicbus_accessory->read() & 0x03;
+	m_magicbus_pending_configuration = m_magicbus_configuration;
+	m_magicbus_topology_change = MAGICBUS_TOPOLOGY_IDLE;
+	m_magicbus_detached_address = -1;
 	m_magicbus_request = false;
+	m_magicbus_topology_timer->reset();
+	m_magicbus_topology_request = false;
 	m_magicbus_endpoint_request.fill(false);
 	m_magicbus_assigned.fill(false);
 	m_magicbus_address.fill(0xff);
@@ -4500,6 +4738,8 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x01, "One AT keyboard")
 	PORT_CONFSETTING(0x02, "AT keyboard and SCSI target")
 	PORT_CONFSETTING(0x03, "One SCSI target")
+	PORT_CHANGED_MEMBER(
+			DEVICE_SELF, FUNC(datarover_state::magicbus_accessory_changed), 0)
 
 	PORT_START("MAGICBUS_SCSI_REQUEST")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER)
