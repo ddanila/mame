@@ -1053,7 +1053,11 @@ private:
 	void terminal_key(u8 data);
 	template <unsigned Channel> void uart_received(u8 data);
 	void update_irq();
-	void magicbus_set_request(bool asserted);
+	bool magicbus_endpoint_present(unsigned endpoint) const;
+	bool magicbus_endpoint_is_keyboard(unsigned endpoint) const;
+	void magicbus_drive_request(bool asserted);
+	void magicbus_update_request();
+	void magicbus_set_request(unsigned endpoint, bool asserted);
 	void magicbus_command(u16 command);
 	void magicbus_deliver_response();
 	void magicbus_accept_host_data();
@@ -1169,9 +1173,12 @@ private:
 	u8 m_telephone_pulse_count = 0;
 	u64 m_telephone_pulse_break_start = 0;
 	bool m_telephone_pulse_break = false;
+	static constexpr unsigned MAGICBUS_ENDPOINTS = 2;
 	bool m_magicbus_request = false;
-	bool m_magicbus_assigned = false;
-	u8 m_magicbus_info_page = 0;
+	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_endpoint_request{};
+	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_assigned{};
+	std::array<u8, MAGICBUS_ENDPOINTS> m_magicbus_address{};
+	std::array<u8, MAGICBUS_ENDPOINTS> m_magicbus_info_page{};
 	enum : u8
 	{
 		MBUS_RESPONSE_NONE,
@@ -1181,11 +1188,12 @@ private:
 		MBUS_RESPONSE_KEYBOARD
 	};
 	u8 m_magicbus_response = MBUS_RESPONSE_NONE;
-	bool m_magicbus_keyboard_read_pending = false;
-	bool m_magicbus_host_data_pending = false;
-	std::array<u8, 256> m_magicbus_key_data{};
-	u16 m_magicbus_key_head = 0;
-	u16 m_magicbus_key_count = 0;
+	s8 m_magicbus_response_endpoint = -1;
+	s8 m_magicbus_host_data_endpoint = -1;
+	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_keyboard_read_pending{};
+	std::array<std::array<u8, 256>, MAGICBUS_ENDPOINTS> m_magicbus_key_data{};
+	std::array<u16, MAGICBUS_ENDPOINTS> m_magicbus_key_head{};
+	std::array<u16, MAGICBUS_ENDPOINTS> m_magicbus_key_count{};
 	u16 m_main_battery_charge = 0;
 	emu_timer *m_telecom_timer = nullptr;
 	emu_timer *m_telephone_pulse_timer = nullptr;
@@ -2743,11 +2751,34 @@ TIMER_CALLBACK_MEMBER(datarover_state::sound_tick)
 }
 
 
-void datarover_state::magicbus_set_request(bool asserted)
+bool datarover_state::magicbus_endpoint_present(unsigned endpoint) const
 {
-	if (asserted && !magicbus_powered())
-		asserted = false;
+	return endpoint < MAGICBUS_ENDPOINTS
+			&& (m_magicbus_accessory->read() & 0x03) > endpoint;
+}
 
+
+bool datarover_state::magicbus_endpoint_is_keyboard(unsigned endpoint) const
+{
+	return endpoint == 0 && magicbus_endpoint_present(endpoint);
+}
+
+
+void datarover_state::magicbus_update_request()
+{
+	bool asserted = false;
+	if (magicbus_powered())
+	{
+		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+			asserted |= magicbus_endpoint_present(endpoint)
+					&& m_magicbus_endpoint_request[endpoint];
+	}
+	magicbus_drive_request(asserted);
+}
+
+
+void datarover_state::magicbus_drive_request(bool asserted)
+{
 	if (m_magicbus_request == asserted)
 		return;
 
@@ -2759,33 +2790,55 @@ void datarover_state::magicbus_set_request(bool asserted)
 }
 
 
+void datarover_state::magicbus_set_request(unsigned endpoint, bool asserted)
+{
+	if (endpoint >= MAGICBUS_ENDPOINTS)
+		return;
+
+	m_magicbus_endpoint_request[endpoint] = asserted && magicbus_powered()
+			&& magicbus_endpoint_present(endpoint);
+	magicbus_update_request();
+}
+
+
 TIMER_CALLBACK_MEMBER(datarover_state::magicbus_keyboard_tick)
 {
-	for (unsigned drained = 0; drained < m_magicbus_key_data.size(); ++drained)
+	for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
 	{
-		u8 const data = m_magicbus_keyboard->read();
-		if (!data)
-			break;
-
-		// The generic AT keyboard powers up with the 0xaa self-test byte, and
-		// commands sent by the Magic Bus keyboard client produce 0xfa
-		// acknowledgements.  Those are controller protocol bytes, not Set-2
-		// key transitions, and the Magic Cap client only accepts the latter.
-		if (!magicbus_powered() || data == 0xaa || data == 0xfa)
+		if (!magicbus_endpoint_is_keyboard(endpoint))
 			continue;
-
-		if (m_magicbus_key_count < m_magicbus_key_data.size())
+		for (unsigned drained = 0;
+				drained < m_magicbus_key_data[endpoint].size();
+				++drained)
 		{
-			m_magicbus_key_data[
-					(m_magicbus_key_head + m_magicbus_key_count)
-							% m_magicbus_key_data.size()] = data;
-			++m_magicbus_key_count;
-		}
-	}
+			u8 const data = m_magicbus_keyboard->read();
+			if (!data)
+				break;
 
-	if (m_magicbus_key_count && m_magicbus_assigned
-			&& BIT(m_magicbus_accessory->read(), 0))
-		magicbus_set_request(true);
+			// The generic AT keyboard powers up with the 0xaa self-test byte,
+			// and host commands produce 0xfa acknowledgements.  Those are
+			// controller protocol bytes, not Set-2 key transitions.
+			if (!magicbus_powered()
+					|| !magicbus_endpoint_is_keyboard(endpoint)
+					|| data == 0xaa || data == 0xfa)
+				continue;
+
+			if (m_magicbus_key_count[endpoint]
+					< m_magicbus_key_data[endpoint].size())
+			{
+				m_magicbus_key_data[endpoint][
+						(m_magicbus_key_head[endpoint]
+								+ m_magicbus_key_count[endpoint])
+								% m_magicbus_key_data[endpoint].size()] = data;
+				++m_magicbus_key_count[endpoint];
+			}
+		}
+
+		if (m_magicbus_key_count[endpoint]
+				&& m_magicbus_assigned[endpoint]
+				&& !m_magicbus_keyboard_read_pending[endpoint])
+			magicbus_set_request(endpoint, true);
+	}
 }
 
 
@@ -2805,74 +2858,157 @@ void datarover_state::magicbus_command(u16 command)
 	if (!magicbus_powered())
 	{
 		m_magicbus_response = MBUS_RESPONSE_NONE;
-		m_magicbus_keyboard_read_pending = false;
-		m_magicbus_host_data_pending = false;
-		magicbus_set_request(false);
+		m_magicbus_response_endpoint = -1;
+		m_magicbus_host_data_endpoint = -1;
+		m_magicbus_keyboard_read_pending.fill(false);
+		m_magicbus_endpoint_request.fill(false);
+		magicbus_update_request();
 		return;
 	}
 
 	// Wire command words are the SDK's command-table entry XORed with the
-	// peripheral address code.  This model presents one AT keyboard at
-	// address zero; address seven is the broadcast address.
-	switch (command)
+	// peripheral address code.  Both tables are retained in the unstripped
+	// SDK ELF.  Addresses zero through five are assignable; seven broadcasts.
+	static constexpr std::array<u16, 33> command_words{
+		0x0000, 0xc018, 0xc024, 0xc028, 0xc030, 0xc03c, 0xc044, 0xc048,
+		0xc050, 0xc000, 0xc00c, 0xc014, 0xc05c, 0xc060, 0xc06c, 0xc074,
+		0xc078, 0xc084, 0xc088, 0xc090, 0xc09c, 0xd0e0, 0xd0ec, 0xd0a4,
+		0xd0a8, 0xd0b0, 0xd0bc, 0xd0c4, 0xd0c8, 0xd0d0, 0xd0dc, 0xd0f4,
+		0xd0f8
+	};
+	static constexpr std::array<u16, 8> address_codes{
+		0x0c00, 0x0a00, 0x0804, 0x0600, 0x0404, 0x0204, 0x0000, 0x0e04
+	};
+
+	int decoded_command = -1;
+	int decoded_address = -1;
+	for (unsigned address = 0;
+			address < address_codes.size() && decoded_command < 0;
+			++address)
 	{
-	case 0xdef0: // command 31, broadcast: assign an address
-		// The ROM also starts reinitialization with this broadcast.  Its
-		// current client is discarded before the sole attached keyboard is
-		// assigned address zero again, so the peripheral must answer even
-		// when this machine process has seen an earlier assignment.
-		if (BIT(m_magicbus_accessory->read(), 0))
-			magicbus_set_request(true);
-		break;
-
-	case 0xdca8: // command 24, address 0: take the proposed address
-		if (BIT(m_magicbus_accessory->read(), 0) && m_magicbus_request)
+		for (unsigned candidate = 0;
+				candidate < command_words.size();
+				++candidate)
 		{
-			m_magicbus_assigned = true;
-			magicbus_set_request(false);
+			if ((command_words[candidate] ^ address_codes[address]) == command)
+			{
+				decoded_command = candidate;
+				decoded_address = address;
+				break;
+			}
 		}
+	}
+	if (decoded_command < 0)
+		return;
+
+	auto const endpoint_for_address = [this](unsigned address) -> int
+	{
+		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+		{
+			if (magicbus_endpoint_present(endpoint)
+					&& m_magicbus_assigned[endpoint]
+					&& m_magicbus_address[endpoint] == address)
+				return endpoint;
+		}
+		return -1;
+	};
+
+	if (decoded_command == 31 && decoded_address == 7)
+	{
+		bool any_unassigned = false;
+		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+			any_unassigned |= magicbus_endpoint_present(endpoint)
+					&& !m_magicbus_assigned[endpoint];
+
+		// Once every attached endpoint has an address, another FIND begins
+		// bus reinitialization.  During the initial multi-device assignment,
+		// assigned endpoints retain their address while the next unassigned
+		// endpoint continues to hold the shared request line.
+		if (!any_unassigned)
+		{
+			m_magicbus_assigned.fill(false);
+			m_magicbus_address.fill(0xff);
+			m_magicbus_info_page.fill(0);
+		}
+		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+		{
+			if (magicbus_endpoint_present(endpoint)
+					&& !m_magicbus_assigned[endpoint])
+				magicbus_set_request(endpoint, true);
+		}
+		return;
+	}
+
+	if (decoded_command == 24 && decoded_address < 6)
+	{
+		for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
+		{
+			if (magicbus_endpoint_present(endpoint)
+					&& !m_magicbus_assigned[endpoint]
+					&& m_magicbus_endpoint_request[endpoint])
+			{
+				m_magicbus_assigned[endpoint] = true;
+				m_magicbus_address[endpoint] = decoded_address;
+				magicbus_set_request(endpoint, false);
+				break;
+			}
+		}
+		return;
+	}
+
+	int const endpoint = endpoint_for_address(decoded_address);
+	if (decoded_command == 28)
+	{
+		// Request polling is address-multiplexed on the physical shared
+		// line: non-addressed peripherals temporarily release MBReq, leaving
+		// only the selected endpoint's level visible to the controller.
+		if (decoded_address == 7)
+			magicbus_update_request();
+		else
+			magicbus_drive_request(endpoint >= 0
+					&& m_magicbus_endpoint_request[endpoint]);
+		return;
+	}
+	if (endpoint < 0)
+		return;
+
+	switch (decoded_command)
+	{
+	case 21: // finish address assignment
+	case 25: // acknowledge another endpoint waiting on the shared request line
 		break;
 
-	case 0xcc5c: // command 12: select the fixed identification record
-		if (m_magicbus_assigned)
-			m_magicbus_info_page = 1;
+	case 12: // select the fixed identification record
+		m_magicbus_info_page[endpoint] = 1;
 		break;
 
-	case 0xcc60: // command 13: select the full peripheral-information record
-		if (m_magicbus_assigned)
-			m_magicbus_info_page = 2;
+	case 13: // select the full peripheral-information record
+		m_magicbus_info_page[endpoint] = 2;
 		break;
 
-	case 0xcc18: // command 1: read the peripheral request record
-		if (m_magicbus_assigned && m_magicbus_request)
+	case 1: // read the peripheral request record
+		if (m_magicbus_endpoint_request[endpoint])
 		{
 			m_magicbus_response = MBUS_RESPONSE_REQUEST;
-			m_magicbus_keyboard_read_pending = true;
+			m_magicbus_response_endpoint = endpoint;
+			m_magicbus_keyboard_read_pending[endpoint] = true;
 		}
 		break;
 
-	case 0xcc24: // command 2: read the selected data
-		if (m_magicbus_assigned)
-		{
-			if (m_magicbus_keyboard_read_pending)
-				m_magicbus_response = MBUS_RESPONSE_KEYBOARD;
-			else if (m_magicbus_info_page == 1)
-				m_magicbus_response = MBUS_RESPONSE_ID;
-			else if (m_magicbus_info_page == 2)
-				m_magicbus_response = MBUS_RESPONSE_INFO;
-		}
+	case 2: // read the selected data
+		if (m_magicbus_keyboard_read_pending[endpoint])
+			m_magicbus_response = MBUS_RESPONSE_KEYBOARD;
+		else if (m_magicbus_info_page[endpoint] == 1)
+			m_magicbus_response = MBUS_RESPONSE_ID;
+		else if (m_magicbus_info_page[endpoint] == 2)
+			m_magicbus_response = MBUS_RESPONSE_INFO;
+		if (m_magicbus_response != MBUS_RESPONSE_NONE)
+			m_magicbus_response_endpoint = endpoint;
 		break;
 
-	case 0xcc3c: // command 5: write an AT-keyboard control packet
-		if (m_magicbus_assigned)
-			m_magicbus_host_data_pending = true;
-		break;
-
-	case 0xdcc8: // command 28, address 0: poll/acknowledge the request line
-	case 0xdecc: // command 28, broadcast
-		// These delimit the ROM's poll transaction.  The line is cleared
-		// when its request record is read and must stay clear while that
-		// record waits in the client's software queue.
+	case 5: // write an AT-keyboard control packet
+		if (magicbus_endpoint_is_keyboard(endpoint))
+			m_magicbus_host_data_endpoint = endpoint;
 		break;
 
 	default:
@@ -2886,8 +3022,16 @@ void datarover_state::magicbus_deliver_response()
 	if (!magicbus_powered())
 	{
 		m_magicbus_response = MBUS_RESPONSE_NONE;
+		m_magicbus_response_endpoint = -1;
 		return;
 	}
+	if (m_magicbus_response_endpoint < 0
+			|| m_magicbus_response_endpoint >= MAGICBUS_ENDPOINTS)
+	{
+		m_magicbus_response = MBUS_RESPONSE_NONE;
+		return;
+	}
+	unsigned const endpoint = m_magicbus_response_endpoint;
 
 	std::array<u8, 88> response{};
 	unsigned response_size = 0;
@@ -2895,10 +3039,10 @@ void datarover_state::magicbus_deliver_response()
 	switch (m_magicbus_response)
 	{
 	case MBUS_RESPONSE_ID:
-		response[0] = 'A';
-		response[1] = 'T';
-		response[2] = 'K';
-		response[3] = 'B';
+		response[0] = endpoint ? 'S' : 'A';
+		response[1] = endpoint ? 'C' : 'T';
+		response[2] = endpoint ? 'T' : 'K';
+		response[3] = endpoint ? 'G' : 'B';
 		response_size = 4;
 		break;
 
@@ -2919,10 +3063,10 @@ void datarover_state::magicbus_deliver_response()
 
 		// MagicbusPeripheralInfo, reconstructed from the SDK ELF's retained
 		// type information.  The three variable strings are empty; the ROM
-		// selects its built-in AT-keyboard client from the peripheral ID.
+		// selects its built-in keyboard or SCSI-target client from the ID.
 		put_be16(0, 0);
 		put_be16(2, 84);
-		put_be32(4, 0x4154'4b42); // "ATKB"
+		put_be32(4, endpoint ? 0x5343'5447 : 0x4154'4b42); // "SCTG"/"ATKB"
 		response[8] = 1;          // hardware version
 		response[9] = 1;          // software version
 		response[10] = 1;         // protocol version
@@ -2952,23 +3096,26 @@ void datarover_state::magicbus_deliver_response()
 		// copied into the ROM's 16-byte queue entry.
 		response[1] = 14;
 		response_size = 16;
-		magicbus_set_request(false);
+		magicbus_set_request(endpoint, false);
 		break;
 
 	case MBUS_RESPONSE_KEYBOARD:
 	{
-		unsigned const count = std::min<unsigned>(m_magicbus_key_count, 15);
+		unsigned const count =
+				std::min<unsigned>(m_magicbus_key_count[endpoint], 15);
 		response[0] = count;
 		for (unsigned index = 0; index < count; ++index)
 		{
-			response[index + 1] = m_magicbus_key_data[m_magicbus_key_head];
-			m_magicbus_key_head =
-					(m_magicbus_key_head + 1) % m_magicbus_key_data.size();
+			response[index + 1] =
+					m_magicbus_key_data[endpoint][m_magicbus_key_head[endpoint]];
+			m_magicbus_key_head[endpoint] =
+					(m_magicbus_key_head[endpoint] + 1)
+							% m_magicbus_key_data[endpoint].size();
 		}
-		m_magicbus_key_count -= count;
+		m_magicbus_key_count[endpoint] -= count;
 		response_size = 16;
-		m_magicbus_keyboard_read_pending = false;
-		magicbus_set_request(m_magicbus_key_count != 0);
+		m_magicbus_keyboard_read_pending[endpoint] = false;
+		magicbus_set_request(endpoint, m_magicbus_key_count[endpoint] != 0);
 		break;
 	}
 
@@ -2977,6 +3124,7 @@ void datarover_state::magicbus_deliver_response()
 	}
 
 	m_magicbus_response = MBUS_RESPONSE_NONE;
+	m_magicbus_response_endpoint = -1;
 
 	if (BIT(m_dino[DINO_MBUS_CONTROL1], 16))
 	{
@@ -3006,9 +3154,12 @@ void datarover_state::magicbus_deliver_response()
 void datarover_state::magicbus_accept_host_data()
 {
 	if (!magicbus_powered()
-			|| !m_magicbus_host_data_pending
+			|| m_magicbus_host_data_endpoint < 0
+			|| m_magicbus_host_data_endpoint >= MAGICBUS_ENDPOINTS
+			|| !magicbus_endpoint_is_keyboard(m_magicbus_host_data_endpoint)
 			|| !BIT(m_dino[DINO_MBUS_CONTROL1], 15))
 		return;
+	unsigned const endpoint = m_magicbus_host_data_endpoint;
 
 	// The ROM's AT-keyboard client wraps controller commands in an eight-byte
 	// Magic Bus packet beginning with "K".  MAME already generates Set-2
@@ -3024,8 +3175,8 @@ void datarover_state::magicbus_accept_host_data()
 		switch (space.read_byte(start + 1))
 		{
 		case 1: // reset
-			m_magicbus_key_head = 0;
-			m_magicbus_key_count = 0;
+			m_magicbus_key_head[endpoint] = 0;
+			m_magicbus_key_count[endpoint] = 0;
 			m_magicbus_keyboard->write(0xff);
 			break;
 
@@ -3043,7 +3194,7 @@ void datarover_state::magicbus_accept_host_data()
 		}
 	}
 
-	m_magicbus_host_data_pending = false;
+	m_magicbus_host_data_endpoint = -1;
 	m_dino[DINO_MBUS_DMA_COUNT] = count >= 4 ? count - 4 : 0;
 	m_dino[DINO_INTERRUPT2] |= INT2_MBUS_DMA_END;
 }
@@ -3244,12 +3395,12 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 
 	case DINO_MBUS_DATA:
 		COMBINE_DATA(&m_dino[offset]);
-		if (m_magicbus_host_data_pending)
+		if (m_magicbus_host_data_endpoint >= 0)
 		{
 			// Type-2 writes of four bytes or fewer use the hold register
 			// rather than DMA.  No current ATKB control packet is that short,
 			// but completing it here preserves the controller semantics.
-			m_magicbus_host_data_pending = false;
+			m_magicbus_host_data_endpoint = -1;
 			m_dino[DINO_INTERRUPT2] |= INT2_MBUS_EMPTY;
 		}
 		break;
@@ -3288,14 +3439,17 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		{
 			// Removing accessory power loses its address and pending
 			// transaction.  A later broadcast FIND discovers it afresh.
-			m_magicbus_assigned = false;
-			m_magicbus_info_page = 0;
+			m_magicbus_assigned.fill(false);
+			m_magicbus_address.fill(0xff);
+			m_magicbus_info_page.fill(0);
 			m_magicbus_response = MBUS_RESPONSE_NONE;
-			m_magicbus_keyboard_read_pending = false;
-			m_magicbus_host_data_pending = false;
-			m_magicbus_key_head = 0;
-			m_magicbus_key_count = 0;
-			magicbus_set_request(false);
+			m_magicbus_response_endpoint = -1;
+			m_magicbus_host_data_endpoint = -1;
+			m_magicbus_keyboard_read_pending.fill(false);
+			m_magicbus_endpoint_request.fill(false);
+			m_magicbus_key_head.fill(0);
+			m_magicbus_key_count.fill(0);
+			magicbus_update_request();
 		}
 		break;
 	}
@@ -3518,11 +3672,14 @@ void datarover_state::machine_start()
 	save_item(NAME(m_telephone_pulse_break_start));
 	save_item(NAME(m_telephone_pulse_break));
 	save_item(NAME(m_magicbus_request));
+	save_item(NAME(m_magicbus_endpoint_request));
 	save_item(NAME(m_magicbus_assigned));
+	save_item(NAME(m_magicbus_address));
 	save_item(NAME(m_magicbus_info_page));
 	save_item(NAME(m_magicbus_response));
+	save_item(NAME(m_magicbus_response_endpoint));
 	save_item(NAME(m_magicbus_keyboard_read_pending));
-	save_item(NAME(m_magicbus_host_data_pending));
+	save_item(NAME(m_magicbus_host_data_endpoint));
 	save_item(NAME(m_magicbus_key_data));
 	save_item(NAME(m_magicbus_key_head));
 	save_item(NAME(m_magicbus_key_count));
@@ -3594,13 +3751,16 @@ void datarover_state::machine_reset()
 	m_telephone_pulse_break_start = 0;
 	m_telephone_pulse_break = false;
 	m_magicbus_request = false;
-	m_magicbus_assigned = false;
-	m_magicbus_info_page = 0;
+	m_magicbus_endpoint_request.fill(false);
+	m_magicbus_assigned.fill(false);
+	m_magicbus_address.fill(0xff);
+	m_magicbus_info_page.fill(0);
 	m_magicbus_response = MBUS_RESPONSE_NONE;
-	m_magicbus_keyboard_read_pending = false;
-	m_magicbus_host_data_pending = false;
-	m_magicbus_key_head = 0;
-	m_magicbus_key_count = 0;
+	m_magicbus_response_endpoint = -1;
+	m_magicbus_keyboard_read_pending.fill(false);
+	m_magicbus_host_data_endpoint = -1;
+	m_magicbus_key_head.fill(0);
+	m_magicbus_key_count.fill(0);
 	m_magicbus_keyboard_timer->adjust(
 			attotime::from_msec(1), 0, attotime::from_hz(240));
 	m_battery_charge_timer->adjust(
@@ -3734,9 +3894,10 @@ static INPUT_PORTS_START(datarover840)
 	PORT_CONFSETTING(0x00, "Freeze at saved value")
 
 	PORT_START("MAGICBUS_ACCESSORY")
-	PORT_CONFNAME(0x01, 0x01, "Magic Bus accessory")
-	PORT_CONFSETTING(0x01, "AT keyboard")
+	PORT_CONFNAME(0x03, 0x01, "Magic Bus accessories")
 	PORT_CONFSETTING(0x00, "None")
+	PORT_CONFSETTING(0x01, "One AT keyboard")
+	PORT_CONFSETTING(0x02, "AT keyboard and SCSI target")
 
 	PORT_START("IRDA_CARRIER")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER)
