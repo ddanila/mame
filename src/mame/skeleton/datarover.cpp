@@ -19,11 +19,12 @@
     uncached ROM alias, 0xb3c0001c.
 
     The R3900 CPU device supplies the documented PRId, cache sizes and
-    TLB-less kuseg mapping.  Dino, Glacier and Betty are early behavioural
-    stubs derived from the matching unstripped Icras SDK ELF.
+    TLB-less kuseg mapping.  Dino, Glacier and Betty are behavioural models
+    derived from the matching unstripped Icras SDK ELF and ROM execution.
 
-    TODO:
+    Evidence-limited fidelity boundaries (do not guess):
       - recover Dino external-bus timing from real hardware
+      - recover exact Apollo Magic Bus timing from a trace or board document
       - model consumer IR, SPI and CHI when hardware evidence becomes available
 
 ***************************************************************************/
