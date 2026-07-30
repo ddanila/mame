@@ -79,6 +79,10 @@ constexpr u8 COP0_PRId     = 15;
 constexpr u8 COP0_Debug    = 16; // r3900 only
 constexpr u8 COP0_DEPC     = 17; // r3900 only
 
+constexpr u32 CONFIG_HALT = 0x0000'0100;
+constexpr u32 CONFIG_DOZE = 0x0000'0200;
+constexpr u32 CONFIG_POWER_DOWN = CONFIG_HALT | CONFIG_DOZE;
+
 enum sr_mask : u32
 {
 	SR_IEc    = 0x00000001, // interrupt enable (current)
@@ -464,6 +468,16 @@ void mips1core_device_base::execute_run()
 	// core execution loop
 	while (m_icount-- > 0)
 	{
+		// Halt and Doze retain the pipeline until a physical interrupt, NMI
+		// or reset clears the corresponding R3900 Config bit.  Check every
+		// iteration because MTC0 may enter a mode within this timeslice.
+		if (m_multiply_to_gpr
+				&& (m_cop0[COP0_Config] & CONFIG_POWER_DOWN))
+		{
+			m_icount = 0;
+			return;
+		}
+
 		int const cycle_start = m_icount;
 		bool divide_started = false;
 		bool const debug_step_suppressed = m_debug_step_suppress;
@@ -1109,12 +1123,18 @@ void mips1core_device_base::execute_set_input(int irqline, int state)
 		bool const asserted = state != CLEAR_LINE;
 		if (m_multiply_to_gpr && asserted && !m_nmi_line)
 			m_nmi_pending = true;
+		if (m_multiply_to_gpr && asserted)
+			m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
 		m_nmi_line = asserted;
 		return;
 	}
 
 	if (state != CLEAR_LINE)
+	{
 		CAUSE |= CAUSE_IPEX0 << irqline;
+		if (m_multiply_to_gpr)
+			m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
+	}
 	else
 		CAUSE &= ~(CAUSE_IPEX0 << irqline);
 }
@@ -1241,6 +1261,10 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 			m_cop0[COP0_Config] =
 					(m_cop0[COP0_Config] & 0x003f'0000)
 					| (data & 0x0000'0fff);
+			if ((CAUSE & CAUSE_IPEX)
+					|| m_nmi_line
+					|| m_nmi_pending)
+				m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
 			// RF selects the processor clock divided by 1, 2, 4, or 8.
 			// External devices retain their independently configured clocks.
 			set_clock_scale(
@@ -1301,7 +1325,8 @@ unsigned r3900_device::cache_refill_words(bool icache) const
 
 void r3900_device::invalidate_data_cache(u32 address, u32 bytes)
 {
-	if (!bytes)
+	// Doze permits external cache snooping, while Halt explicitly does not.
+	if (!bytes || (m_cop0[COP0_Config] & CONFIG_HALT))
 		return;
 
 	// Dino DMA uses physical addresses while the R3900 can cache the same
@@ -1623,7 +1648,7 @@ void mips1core_device_base::generate_nmi_exception()
 	}
 	m_branch_state = EXCEPTION;
 	SR |= SR_NMI;
-	m_cop0[COP0_Config] &= ~0x0000'0300; // Halt and Doze
+	m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
 	m_pc = 0xbfc0'0000;
 }
 
