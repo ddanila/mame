@@ -62,8 +62,9 @@ constexpr u8 COP0_Index    = 0;
 constexpr u8 COP0_Random   = 1;
 constexpr u8 COP0_EntryLo  = 2;
 constexpr u8 COP0_BusCtrl  = 2;  // r3041 only
-constexpr u8 COP0_Config   = 3;  // r3041/r3071/r3081 only
+constexpr u8 COP0_Config   = 3;  // r3041/r3071/r3081/r3900 only
 constexpr u8 COP0_Context  = 4;
+constexpr u8 COP0_Cache    = 7;  // r3900 only
 constexpr u8 COP0_BadVAddr = 8;
 constexpr u8 COP0_Count    = 9;  // r3041 only
 constexpr u8 COP0_EntryHi  = 10;
@@ -287,6 +288,25 @@ r3081_device::r3081_device(machine_config const &mconfig, char const *tag, devic
 r3900_device::r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true, true)
 {
+}
+
+void r3900_device::device_start()
+{
+	mips1core_device_base::device_start();
+
+	state_add(MIPS1_COP0 + COP0_Config, "Config", m_cop0[COP0_Config]);
+	state_add(MIPS1_COP0 + COP0_Cache, "Cache", m_cop0[COP0_Cache]);
+}
+
+void r3900_device::device_reset()
+{
+	mips1core_device_base::device_reset();
+
+	// The TMPR3902U has a 4 KiB instruction cache and 1 KiB data cache.
+	// Both caches are enabled after reset; all other writable fields and
+	// all cache auto-lock modes are clear.
+	m_cop0[COP0_Config] = 0x0010'0030;
+	m_cop0[COP0_Cache] = 0;
 }
 
 iop_device::iop_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -855,10 +875,78 @@ mips1core_device_base::translate_result r3900_device::translate(int intention, o
 {
 	// The R3900 has no TLB.  Unlike the IDT-derived embedded cores above,
 	// its kuseg addresses map directly to the corresponding physical address.
+	translate_result result;
 	if (!BIT(address, 31))
-		return m_cache;
+		result = m_cache;
+	else
+		result = mips1core_device_base::translate(intention, address, debug);
 
-	return mips1core_device_base::translate(intention, address, debug);
+	// Disabled caches behave like uncached accesses: every access misses and
+	// no refill takes place.  Instruction and data enables are independent.
+	if (result == CACHED
+			&& !BIT(m_cop0[COP0_Config], intention == TR_FETCH ? 5 : 4))
+		return UNCACHED;
+
+	return result;
+}
+
+void r3900_device::exception_enter()
+{
+	// DALc/IALc and DALp/IALp form the same three-level exception stack as
+	// the Status register's current/previous/old mode bits.
+	u32 const modes = m_cop0[COP0_Cache];
+	m_cop0[COP0_Cache] =
+			(modes & ~0x0000'3f00) | ((modes << 2) & 0x0000'3c00);
+}
+
+void r3900_device::handle_rfe()
+{
+	// R3900 RFE leaves the old Status and Cache modes intact while copying
+	// old to previous and previous to current.
+	SR = (SR & ~0x0000'000f) | ((SR >> 2) & 0x0000'000f);
+	if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
+		debugger_privilege_hook();
+
+	u32 const modes = m_cop0[COP0_Cache];
+	m_cop0[COP0_Cache] =
+			(modes & ~0x0000'0f00) | ((modes >> 2) & 0x0000'0f00);
+}
+
+u32 r3900_device::get_cop0_reg(unsigned const reg)
+{
+	switch (reg)
+	{
+	case COP0_Config:
+	case COP0_Cache:
+		return m_cop0[reg];
+
+	default:
+		return mips1core_device_base::get_cop0_reg(reg);
+	}
+}
+
+void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
+{
+	switch (reg)
+	{
+	case COP0_Config:
+		// ICS/DCS are read-only implementation sizes.  Reserved bits read
+		// zero, and setting Lock prevents all writes until reset.
+		if (!BIT(m_cop0[COP0_Config], 7))
+			m_cop0[COP0_Config] =
+					(m_cop0[COP0_Config] & 0x003f'0000)
+					| (data & 0x0000'0fff);
+		break;
+
+	case COP0_Cache:
+		// Only the six current/previous/old I/D auto-lock mode bits exist.
+		m_cop0[COP0_Cache] = data & 0x0000'3f00;
+		break;
+
+	default:
+		mips1core_device_base::set_cop0_reg(reg, data);
+		break;
+	}
 }
 
 void r3900_device::handle_cache(u32 const op)
@@ -959,11 +1047,17 @@ void mips1core_device_base::generate_exception(u32 exception, bool refill)
 	// hook exception in caller context enabling debugger access to memory parameters
 	debugger_exception_hook(exception);
 
+	exception_enter();
+
 	// shift the exception bits
 	SR = (SR & ~SR_KUIE) | ((SR << 2) & SR_KUIEop);
 
 	if (SR & SR_KUp)
 		debugger_privilege_hook();
+}
+
+void mips1core_device_base::exception_enter()
+{
 }
 
 void mips1core_device_base::address_error(int intention, u32 const address)
@@ -1017,9 +1111,7 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		switch (op & 31)
 		{
 			case 0x10: // RFE
-				SR = (SR & ~SR_KUIE) | ((SR >> 2) & SR_KUIEpc);
-				if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
-					debugger_privilege_hook();
+				handle_rfe();
 				break;
 			default:
 				generate_exception(EXCEPTION_INVALIDOP);
@@ -1030,6 +1122,13 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		generate_exception(EXCEPTION_INVALIDOP);
 		break;
 	}
+}
+
+void mips1core_device_base::handle_rfe()
+{
+	SR = (SR & ~SR_KUIE) | ((SR >> 2) & SR_KUIEpc);
+	if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
+		debugger_privilege_hook();
 }
 
 u32 mips1core_device_base::get_cop0_reg(unsigned const reg)
