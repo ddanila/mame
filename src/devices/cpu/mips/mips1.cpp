@@ -33,6 +33,7 @@ enum registers : unsigned
 	MIPS1_LO,
 	MIPS1_FCR30,
 	MIPS1_FCR31,
+	MIPS1_NMI,
 };
 
 enum exception : u32
@@ -110,6 +111,7 @@ enum sr_mask : u32
 	SR_KUIEpc = 0x0000000f, // previous and current interrupt enable and user mode bits
 	SR_KUIEop = 0x0000003c, // old and previous interrupt enable and user mode bits
 	SR_IM     = 0x0000ff00, // all interrupt mask bits
+	SR_NMI    = 0x00100000, // R3900 non-maskable interrupt status
 };
 
 enum cause_mask : u32
@@ -134,6 +136,8 @@ enum debug_mask : u32
 {
 	DEBUG_DBD = 0x8000'0000, // debug branch delay
 	DEBUG_DM  = 0x4000'0000, // debug mode
+	DEBUG_NIS = 0x0000'4000, // coincident non-maskable interrupt
+	DEBUG_OES = 0x0000'1000, // coincident ordinary exception
 	DEBUG_BSF = 0x0000'0400, // bus error exception flag
 	DEBUG_SST = 0x0000'0100, // single step enable
 	DEBUG_DBP = 0x0000'0002, // debug breakpoint
@@ -236,6 +240,8 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_divide_cycles(0)
 	, m_gpr_delay(0)
 	, m_debug_step_suppress(false)
+	, m_nmi_line(false)
+	, m_nmi_pending(false)
 	, m_icount(0)
 	, m_icache(icache_size)
 	, m_dcache(dcache_size, dcache_ways)
@@ -315,6 +321,7 @@ void r3900_device::device_start()
 	state_add(MIPS1_COP0 + COP0_Cache, "Cache", m_cop0[COP0_Cache]);
 	state_add(MIPS1_COP0 + COP0_Debug, "Debug", m_cop0[COP0_Debug]);
 	state_add(MIPS1_COP0 + COP0_DEPC, "DEPC", m_cop0[COP0_DEPC]);
+	state_add(MIPS1_NMI, "NMI", m_nmi_pending).mask(1);
 }
 
 void r3900_device::device_reset()
@@ -369,6 +376,8 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_divide_cycles));
 	save_item(NAME(m_gpr_delay));
 	save_item(NAME(m_debug_step_suppress));
+	save_item(NAME(m_nmi_line));
+	save_item(NAME(m_nmi_pending));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -428,6 +437,8 @@ void mips1core_device_base::device_reset()
 	m_divide_cycles = 0;
 	m_gpr_delay = 0;
 	m_debug_step_suppress = false;
+	m_nmi_line = false;
+	m_nmi_pending = false;
 	m_icache.reset();
 	m_dcache.reset();
 
@@ -457,14 +468,51 @@ void mips1core_device_base::execute_run()
 		// debugging
 		debugger_instruction_hook(m_pc);
 
-		if (m_multiply_to_gpr
+		bool const debug_step =
+				m_multiply_to_gpr
 				&& !debug_step_suppressed
 				&& (m_branch_state != DELAY)
 				&& (m_cop0[COP0_Debug] & DEBUG_SST)
-				&& !(m_cop0[COP0_Debug] & DEBUG_DM))
+				&& !(m_cop0[COP0_Debug] & DEBUG_DM);
+		bool const nmi =
+				m_multiply_to_gpr
+				&& m_nmi_pending
+				&& !(m_cop0[COP0_Debug] & DEBUG_DM);
+
+		if (debug_step)
 		{
-			generate_debug_exception(DEBUG_DSS);
+			// The TX39 records an asynchronous exception coincident with a
+			// debug single step in the ordinary exception registers, then
+			// enters debug mode with DEPC still naming the stepped boundary.
+			u32 const debug_pc = m_pc;
+			branch_state const debug_branch_state = m_branch_state;
+			u32 coincident = 0;
+			if (nmi)
+			{
+				generate_nmi_exception();
+				coincident = DEBUG_NIS;
+			}
+			else if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
+			{
+				for (int irqline = 0; irqline < 6; irqline++)
+					if (CAUSE & SR & (CAUSE_IPEX0 << irqline))
+					{
+						standard_irq_callback(irqline, m_pc);
+						break;
+					}
+				generate_exception(EXCEPTION_INTERRUPT);
+				coincident = DEBUG_OES;
+			}
+
+			if (coincident)
+			{
+				m_pc = debug_pc;
+				m_branch_state = debug_branch_state;
+			}
+			generate_debug_exception(DEBUG_DSS | coincident);
 		}
+		else if (nmi)
+			generate_nmi_exception();
 		else
 		{
 			// fetch instruction
@@ -1053,6 +1101,15 @@ void mips1core_device_base::execute_run()
 
 void mips1core_device_base::execute_set_input(int irqline, int state)
 {
+	if (irqline == INPUT_LINE_NMI)
+	{
+		bool const asserted = state != CLEAR_LINE;
+		if (m_multiply_to_gpr && asserted && !m_nmi_line)
+			m_nmi_pending = true;
+		m_nmi_line = asserted;
+		return;
+	}
+
 	if (state != CLEAR_LINE)
 		CAUSE |= CAUSE_IPEX0 << irqline;
 	else
@@ -1191,6 +1248,14 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 	case COP0_Cache:
 		// Only the six current/previous/old I/D auto-lock mode bits exist.
 		m_cop0[COP0_Cache] = data & 0x0000'3f00;
+		break;
+
+	case COP0_Status:
+		// NmI is a write-one-to-clear status latch on the R3900.
+		mips1core_device_base::set_cop0_reg(
+				reg,
+				(data & ~SR_NMI)
+						| ((data & SR_NMI) ? 0 : (SR & SR_NMI)));
 		break;
 
 	case COP0_Debug:
@@ -1537,6 +1602,26 @@ void mips1core_device_base::generate_debug_exception(u32 const cause)
 	m_cop0[COP0_Debug] = debug | DEBUG_DM | cause;
 	m_branch_state = EXCEPTION;
 	m_pc = 0xbfc0'0200;
+}
+
+void mips1core_device_base::generate_nmi_exception()
+{
+	// R3900 NMI retains the ordinary mode stacks but records the interrupted
+	// boundary, sets the write-one-to-clear status latch, and enters the
+	// fixed uncached reset/NMI vector.
+	m_nmi_pending = false;
+	m_gpr_delay = 0;
+	m_cop0[COP0_EPC] = m_pc;
+	CAUSE &= ~CAUSE_BD;
+	if (m_branch_state == DELAY)
+	{
+		m_cop0[COP0_EPC] -= 4;
+		CAUSE |= CAUSE_BD;
+	}
+	m_branch_state = EXCEPTION;
+	SR |= SR_NMI;
+	m_cop0[COP0_Config] &= ~0x0000'0300; // Halt and Doze
+	m_pc = 0xbfc0'0000;
 }
 
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
