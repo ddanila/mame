@@ -50,6 +50,7 @@ protected:
 	virtual void set_cop0_reg(unsigned const reg, u32 const data);
 
 	// other coprocessors
+	void handle_cop_branch(unsigned cop, u32 const op);
 	virtual void handle_cop1(u32 const op);
 	virtual void handle_cop2(u32 const op);
 	virtual void handle_cop3(u32 const op);
