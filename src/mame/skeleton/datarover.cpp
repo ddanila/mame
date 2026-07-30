@@ -83,6 +83,22 @@ public:
 		transmit_byte(data);
 	}
 
+	void configure(u32 control1, u32 control2)
+	{
+		u32 const bit_rate = 0x0003'8400 / ((control2 & 0x03ff) + 1);
+		parity_t const parity = !BIT(control1, 1)
+				? PARITY_NONE
+				: BIT(control1, 2) ? PARITY_EVEN : PARITY_ODD;
+
+		set_data_frame(
+				1,
+				BIT(control1, 3) ? 7 : 8,
+				parity,
+				BIT(control1, 5) ? STOP_BITS_2 : STOP_BITS_1);
+		set_tra_rate(bit_rate);
+		set_rcv_rate(bit_rate);
+	}
+
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
@@ -865,8 +881,10 @@ protected:
 
 private:
 	static constexpr u32 DINO_UART_A_CONTROL1 = 0x0b0 / 4;
+	static constexpr u32 DINO_UART_A_CONTROL2 = 0x0b4 / 4;
 	static constexpr u32 DINO_UART_A_HOLD = 0x0c4 / 4;
 	static constexpr u32 DINO_UART_B_CONTROL1 = 0x0c8 / 4;
+	static constexpr u32 DINO_UART_B_CONTROL2 = 0x0cc / 4;
 	static constexpr u32 DINO_UART_B_HOLD = 0x0dc / 4;
 	static constexpr u32 DINO_UART_ENABLED_STATUS = 0x8000'0000;
 	static constexpr u32 DINO_UART_EMPTY_STATUS = 0x4000'0000;
@@ -1049,6 +1067,7 @@ private:
 	bool main_battery_charging() const;
 	u32 uart_interrupt_r() const;
 	u32 uart_control_r(unsigned channel) const;
+	void uart_configure(unsigned channel);
 	u32 uart_hold_r(unsigned channel);
 	void uart_hold_w(unsigned channel, u32 data, u32 mem_mask);
 	bool uart_pulsed(unsigned channel) const;
@@ -1527,6 +1546,14 @@ u32 datarover_state::uart_control_r(unsigned channel) const
 		result |= DINO_UART_PRX_HOLD_FULL;
 
 	return result;
+}
+
+
+void datarover_state::uart_configure(unsigned channel)
+{
+	m_uart[channel]->configure(
+			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1],
+			m_dino[channel ? DINO_UART_B_CONTROL2 : DINO_UART_A_CONTROL2]);
 }
 
 
@@ -3416,6 +3443,19 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 {
 	switch (offset)
 	{
+	case DINO_UART_A_CONTROL1:
+	case DINO_UART_B_CONTROL1:
+		COMBINE_DATA(&m_dino[offset]);
+		m_dino[offset] &= ~DINO_UART_STATUS;
+		uart_configure(offset == DINO_UART_B_CONTROL1);
+		break;
+
+	case DINO_UART_A_CONTROL2:
+	case DINO_UART_B_CONTROL2:
+		COMBINE_DATA(&m_dino[offset]);
+		uart_configure(offset == DINO_UART_B_CONTROL2);
+		break;
+
 	case DINO_UART_A_HOLD:
 		uart_hold_w(0, data, mem_mask);
 		break;
@@ -4073,9 +4113,18 @@ static INPUT_PORTS_START(datarover840)
 INPUT_PORTS_END
 
 
-static DEVICE_INPUT_DEFAULTS_START(datarover_rs232_defaults)
+static DEVICE_INPUT_DEFAULTS_START(datarover_rs232a_defaults)
 	DEVICE_INPUT_DEFAULTS("RS232_TXBAUD", 0xff, RS232_BAUD_19200)
 	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_19200)
+	DEVICE_INPUT_DEFAULTS("RS232_DATABITS", 0xff, RS232_DATABITS_8)
+	DEVICE_INPUT_DEFAULTS("RS232_PARITY", 0xff, RS232_PARITY_NONE)
+	DEVICE_INPUT_DEFAULTS("RS232_STOPBITS", 0xff, RS232_STOPBITS_1)
+DEVICE_INPUT_DEFAULTS_END
+
+
+static DEVICE_INPUT_DEFAULTS_START(datarover_rs232b_defaults)
+	DEVICE_INPUT_DEFAULTS("RS232_TXBAUD", 0xff, RS232_BAUD_38400)
+	DEVICE_INPUT_DEFAULTS("RS232_RXBAUD", 0xff, RS232_BAUD_38400)
 	DEVICE_INPUT_DEFAULTS("RS232_DATABITS", 0xff, RS232_DATABITS_8)
 	DEVICE_INPUT_DEFAULTS("RS232_PARITY", 0xff, RS232_PARITY_NONE)
 	DEVICE_INPUT_DEFAULTS("RS232_STOPBITS", 0xff, RS232_STOPBITS_1)
@@ -4136,10 +4185,14 @@ void datarover_state::datarover840(machine_config &config)
 		RS232_PORT(config, m_rs232[channel], default_rs232_devices, nullptr);
 		m_rs232[channel]->set_option_device_input_defaults(
 				"null_modem",
-				DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232_defaults));
+				channel
+						? DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232b_defaults)
+						: DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232a_defaults));
 		m_rs232[channel]->set_option_device_input_defaults(
 				"pty",
-				DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232_defaults));
+				channel
+						? DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232b_defaults)
+						: DEVICE_INPUT_DEFAULTS_NAME(datarover_rs232a_defaults));
 		m_uart[channel]->txd_handler().set(
 				m_rs232[channel],
 				FUNC(rs232_port_device::write_txd));
