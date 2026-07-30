@@ -17,7 +17,7 @@ public:
 	void berr_w(int state) { m_bus_error = bool(state); }
 
 protected:
-	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr = false);
+	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr = false, unsigned dcache_ways = 1);
 
 	// device_t implementation
 	virtual void device_start() override ATTR_COLD;
@@ -54,6 +54,8 @@ protected:
 	virtual void handle_cop3(u32 const op);
 	virtual void handle_special2(u32 const op);
 	virtual void handle_cache(u32 const op);
+	virtual bool cache_auto_lock(bool icache) const;
+	virtual bool cache_store_allocate() const;
 
 	// load/store left/right opcodes
 	void lwl(u32 const op);
@@ -72,8 +74,9 @@ protected:
 	template <typename T> unsigned shift_factor(u32 address) const;
 	struct cache
 	{
-		cache(size_t size)
+		cache(size_t size, unsigned ways = 1)
 			: size(size)
+			, ways(ways)
 		{
 		}
 
@@ -93,15 +96,39 @@ protected:
 
 			u32 tag;
 			u32 data;
+			u8 locked;
 		};
 
 		size_t lines() const { return size / 4; }
-		void start() { line = std::make_unique<struct line[]>(lines()); }
+		size_t sets() const { return lines() / ways; }
+		size_t way_size() const { return size / ways; }
+		unsigned index(u32 address) const { return (address >> 2) & (sets() - 1); }
+		struct line &at(unsigned index, unsigned way) const { return line[index * ways + way]; }
+		void start()
+		{
+			line = std::make_unique<struct line[]>(lines());
+			lru = std::make_unique<u8[]>(sets());
+		}
+		void reset()
+		{
+			for (unsigned index = 0; index < sets(); ++index)
+			{
+				lru[index] = 0;
+				for (unsigned way = 0; way < ways; ++way)
+				{
+					at(index, way).invalidate();
+					at(index, way).locked = 0;
+				}
+			}
+		}
 
 		size_t const size;
+		unsigned const ways;
 		std::unique_ptr<struct line[]> line;
+		std::unique_ptr<u8[]> lru;
 	};
 	std::tuple<struct cache::line &, bool> cache_lookup(u32 address, bool invalidate, bool icache = false);
+	void cache_lock(u32 address, bool icache = false);
 
 	// address spaces
 	address_space_config const m_program_config_be;
@@ -270,6 +297,8 @@ protected:
 	virtual void set_cop0_reg(unsigned const reg, u32 const data) override;
 	virtual void handle_special2(u32 const op) override;
 	virtual void handle_cache(u32 const op) override;
+	virtual bool cache_auto_lock(bool icache) const override;
+	virtual bool cache_store_allocate() const override;
 };
 
 class iop_device : public mips1core_device_base
