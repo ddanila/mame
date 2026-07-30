@@ -212,7 +212,7 @@ DEFINE_DEVICE_TYPE(SONYPS2_IOP, iop_device,       "sonyiop", "Sony Playstation 2
 
 ALLOW_SAVE_TYPE(mips1core_device_base::branch_state);
 
-mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr)
+mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr, unsigned dcache_ways)
 	: cpu_device(mconfig, type, tag, owner, clock)
 	, m_program_config_be("program", ENDIANNESS_BIG, 32, 32)
 	, m_program_config_le("program", ENDIANNESS_LITTLE, 32, 32)
@@ -221,7 +221,7 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_multiply_to_gpr(multiply_to_gpr)
 	, m_icount(0)
 	, m_icache(icache_size)
-	, m_dcache(dcache_size)
+	, m_dcache(dcache_size, dcache_ways)
 	, m_cache((icache_size && dcache_size) ? CACHED : UNCACHED)
 	, m_cache_pws(cache_pws)
 	, m_in_brcond(*this, 0)
@@ -286,7 +286,7 @@ r3081_device::r3081_device(machine_config const &mconfig, char const *tag, devic
 }
 
 r3900_device::r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
-	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true, true)
+	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true, true, 2)
 {
 }
 
@@ -359,8 +359,12 @@ void mips1core_device_base::device_start()
 
 	save_pointer(STRUCT_MEMBER(m_icache.line, tag), m_icache.lines());
 	save_pointer(STRUCT_MEMBER(m_icache.line, data), m_icache.lines());
+	save_pointer(STRUCT_MEMBER(m_icache.line, locked), m_icache.lines());
+	save_pointer(NAME(m_icache.lru), m_icache.sets());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, tag), m_dcache.lines());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, data), m_dcache.lines());
+	save_pointer(STRUCT_MEMBER(m_dcache.line, locked), m_dcache.lines());
+	save_pointer(NAME(m_dcache.lru), m_dcache.sets());
 }
 
 void mips1core_device_base::state_import(device_state_entry const &entry)
@@ -393,6 +397,8 @@ void mips1core_device_base::device_reset()
 	// initialize the state
 	m_pc = 0xbfc00000;
 	m_branch_state = NONE;
+	m_icache.reset();
+	m_dcache.reset();
 
 	// non-tlb devices have tlb shut down
 	m_cop0[COP0_Status] = SR_BEV | SR_TS;
@@ -949,6 +955,18 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 	}
 }
 
+bool r3900_device::cache_auto_lock(bool icache) const
+{
+	// The implemented TX39 configuration reserves instruction auto-lock.
+	return !icache && BIT(m_cop0[COP0_Cache], 8);
+}
+
+bool r3900_device::cache_store_allocate() const
+{
+	// The R3900 data cache is write-through without write allocation.
+	return false;
+}
+
 void r3900_device::handle_cache(u32 const op)
 {
 	offs_t address = m_r[RSREG] + SIMMVAL;
@@ -956,11 +974,23 @@ void r3900_device::handle_cache(u32 const op)
 	switch (RTREG)
 	{
 	case 0x00: // instruction cache index invalidate
-		std::get<0>(cache_lookup(address, false, true)).invalidate();
+		if (!BIT(m_cop0[COP0_Config], 5))
+		{
+			// One instruction-cache tag covers four words.
+			for (unsigned word = 0; word < 4; ++word)
+				std::get<0>(
+						cache_lookup(address + word * 4, false, true))
+						.invalidate();
+		}
 		break;
 
 	case 0x05: // data cache index LRU bit clear
-		// MAME's current MIPS-I cache model is direct-mapped.
+		m_dcache.lru[m_dcache.index(address)] = 0;
+		break;
+
+	case 0x09: // data cache index lock bit clear
+		for (unsigned way = 0; way < m_dcache.ways; ++way)
+			m_dcache.at(m_dcache.index(address), way).locked = 0;
 		break;
 
 	case 0x11: // data cache hit invalidate
@@ -968,7 +998,21 @@ void r3900_device::handle_cache(u32 const op)
 		{
 			auto [line, miss] = cache_lookup(address, false);
 			if (!miss)
+			{
 				line.invalidate();
+				if (!line.locked)
+				{
+					unsigned const index = m_dcache.index(address);
+					for (unsigned way = 0; way < m_dcache.ways; ++way)
+					{
+						if (&m_dcache.at(index, way) == &line)
+						{
+							m_dcache.lru[index] = way;
+							break;
+						}
+					}
+				}
+			}
 		}
 		break;
 
@@ -1179,6 +1223,16 @@ void mips1core_device_base::handle_cache(u32 const)
 	generate_exception(EXCEPTION_INVALIDOP);
 }
 
+bool mips1core_device_base::cache_auto_lock(bool icache) const
+{
+	return false;
+}
+
+bool mips1core_device_base::cache_store_allocate() const
+{
+	return true;
+}
+
 void mips1core_device_base::handle_cop2(u32 const op)
 {
 	if (SR & SR_COP2)
@@ -1293,13 +1347,13 @@ void mips1core_device_base::swr(u32 const op)
 
 /*
  * This function determines the active cache (instruction or data) depending on
- * the icache parameter and the status register SwC (swap caches) flag. A line
- * within the cache is then selected based upon the low address bits. The upper
- * address bits are compared with the line tag to identify whether the lookup
- * is a hit or a miss.
+ * the icache parameter and the status register SwC (swap caches) flag. A set
+ * within the cache is selected based upon the low address bits, and every way
+ * is compared with the upper address tag.
  *
- * If the cache lookup misses and the invalidate parameter evaluates to true,
- * the cache line tag is updated to match the input address and invalidated.
+ * A miss selects an invalid unlocked way before the LRU way. If the cache
+ * lookup misses and the invalidate parameter evaluates to true, the selected
+ * cache line tag is updated to match the input address and invalidated.
  *
  * The function returns the selected line and the miss state.
  *
@@ -1311,23 +1365,99 @@ std::tuple<struct mips1core_device_base::cache::line &, bool> mips1core_device_b
 	address &= ~3;
 
 	// select instruction or data cache
-	struct cache const &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
-
-	// select line within cache based on low address bits
-	struct cache::line &l = c.line[(address & (c.size - 1)) >> 2];
+	struct cache &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
+	unsigned const index = c.index(address);
 
 	// clear cache parity error
 	SR &= ~SR_PE;
 
-	// compare cache line tag against upper address bits and line valid bit
-	bool const miss = (l.tag ^ address) & (-c.size | cache::line::INV);
+	// Compare every way before selecting a replacement.
+	unsigned selected = c.lru[index];
+	bool miss = true;
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
+		struct cache::line &candidate = c.at(index, way);
+		if (!((candidate.tag ^ address)
+					& (-c.way_size() | cache::line::INV)))
+		{
+			selected = way;
+			miss = false;
+			break;
+		}
+	}
 
-	// on cache miss, optionally update the line tag and invalidate (cache
-	// miss is usually followed by line replacement)
+	// Prefer an invalid, unlocked way. A locked index can replace only its
+	// unlocked way, independent of the ordinary LRU selector.
+	if (miss)
+	{
+		for (unsigned way = 0; way < c.ways; ++way)
+		{
+			if (!c.at(index, way).locked
+					&& (c.at(index, way).tag & cache::line::INV))
+			{
+				selected = way;
+				break;
+			}
+		}
+		for (unsigned way = 0; c.ways > 1 && way < c.ways; ++way)
+		{
+			if (c.at(index, way).locked)
+				selected = way ^ 1;
+		}
+	}
+
+	struct cache::line &l = c.at(index, selected);
+
+	// A miss is usually followed by line replacement.
 	if (miss && invalidate)
-		l.tag = (address & -c.size) | cache::line::INV;
+	{
+		l.tag = (address & -c.way_size()) | cache::line::INV;
+		l.locked = 0;
+	}
+
+	if (c.ways > 1 && (!miss || invalidate))
+	{
+		// While one way is locked the replacement selector must continue to
+		// name the other way. Otherwise the accessed way becomes most recent.
+		bool locked = false;
+		for (unsigned way = 0; way < c.ways; ++way)
+		{
+			if (c.at(index, way).locked)
+			{
+				c.lru[index] = way ^ 1;
+				locked = true;
+			}
+		}
+		if (!locked)
+			c.lru[index] = selected ^ 1;
+	}
 
 	return std::tie(l, miss);
+}
+
+void mips1core_device_base::cache_lock(u32 address, bool icache)
+{
+	if (!cache_auto_lock(icache))
+		return;
+
+	address &= ~3;
+	struct cache &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
+	if (c.ways < 2)
+		return;
+	unsigned const index = c.index(address);
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
+		struct cache::line &candidate = c.at(index, way);
+		if (!((candidate.tag ^ address)
+					& (-c.way_size() | cache::line::INV)))
+		{
+			for (unsigned other = 0; other < c.ways; ++other)
+				c.at(index, other).locked = other == way;
+			if (c.ways > 1)
+				c.lru[index] = way ^ 1;
+			break;
+		}
+	}
 }
 
 // compute bit position of sub-unit within a word given endianness and address
@@ -1384,6 +1514,7 @@ std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> mi
 			}
 
 			data = l.data >> shift_factor<T>(address);
+			cache_lock(address);
 		}
 		else
 		{
@@ -1435,6 +1566,7 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 		translate_result const t = translate(TR_WRITE, address, false);
 		if (t == ERROR)
 			return;
+		bool write_memory = true;
 
 		// align address for sd[lr] instructions
 		if (!Aligned)
@@ -1442,11 +1574,21 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 
 		if (t == CACHED)
 		{
-			auto [l, miss] = cache_lookup(address, sizeof(T) == 4);
+			auto [l, miss] = cache_lookup(
+					address,
+					sizeof(T) == 4 && cache_store_allocate());
 
-			// cached full word stores always update the cache
+			// Most MIPS-I caches allocate a full-word store miss. The R3900
+			// data cache is explicitly write-through without write allocation.
 			if constexpr (Aligned && sizeof(T) == 4)
-				l.update(data);
+			{
+				if (!miss || cache_store_allocate())
+				{
+					l.update(data);
+					cache_lock(address);
+					write_memory = !l.locked;
+				}
+			}
 			else if (!miss)
 			{
 				if (!m_cache_pws)
@@ -1467,16 +1609,23 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 				// merge data into the cache
 				unsigned const shift = shift_factor<T>(address);
 				l.update(u32(data) << shift, u32(mem_mask) << shift);
+				cache_lock(address);
+				write_memory = !l.locked;
 			}
 		}
 
-		// uncached or write-through store
-		if constexpr (sizeof(T) == 4)
-			space(AS_PROGRAM).write_dword(address, T(data), mem_mask);
-		else if constexpr (sizeof(T) == 2)
-			space(AS_PROGRAM).write_word(address, T(data), mem_mask);
-		else if constexpr (sizeof(T) == 1)
-			space(AS_PROGRAM).write_byte(address, T(data));
+		// Uncached and ordinary cached stores reach memory. A TX39 locked-line
+		// hit updates only the cache until software clears the lock and stores
+		// the value again.
+		if (write_memory)
+		{
+			if constexpr (sizeof(T) == 4)
+				space(AS_PROGRAM).write_dword(address, T(data), mem_mask);
+			else if constexpr (sizeof(T) == 2)
+				space(AS_PROGRAM).write_word(address, T(data), mem_mask);
+			else if constexpr (sizeof(T) == 1)
+				space(AS_PROGRAM).write_byte(address, T(data));
+		}
 	}
 	else
 	{
