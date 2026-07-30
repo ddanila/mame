@@ -1607,26 +1607,7 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		set_cop0_reg(RDREG, m_r[RTREG]);
 		break;
 	case 0x08: // BC0
-		switch (RTREG)
-		{
-		case 0x00: // BC0F
-			if (!m_in_brcond[0]())
-			{
-				m_branch_state = BRANCH;
-				m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-			}
-			break;
-		case 0x01: // BC0T
-			if (m_in_brcond[0]())
-			{
-				m_branch_state = BRANCH;
-				m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-			}
-			break;
-		default:
-			generate_exception(EXCEPTION_INVALIDOP);
-			break;
-		}
+		handle_cop_branch(0, op);
 		break;
 	case 0x10: // COP0
 		switch (op & 31)
@@ -1708,6 +1689,28 @@ void mips1core_device_base::handle_cop1(u32 const op)
 {
 	if (!(SR & SR_COP1))
 		generate_exception(EXCEPTION_BADCOP1);
+	else if (RSREG == 0x08) // BC1
+		handle_cop_branch(1, op);
+	else
+		generate_exception(EXCEPTION_INVALIDOP);
+}
+
+void mips1core_device_base::handle_cop_branch(unsigned const cop, u32 const op)
+{
+	if (RTREG > (m_multiply_to_gpr ? 0x03 : 0x01))
+	{
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	bool const taken = bool(m_in_brcond[cop]()) == bool(RTREG & 1);
+	if (taken)
+	{
+		m_branch_state = BRANCH;
+		m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+	}
+	else if (BIT(RTREG, 1)) // R3900 BCzFL/BCzTL
+		m_branch_state = NULLIFY;
 }
 
 void mips1core_device_base::handle_cache(u32 const)
@@ -1737,26 +1740,7 @@ void mips1core_device_base::handle_cop2(u32 const op)
 		switch (RSREG)
 		{
 		case 0x08: // BC2
-			switch (RTREG)
-			{
-			case 0x00: // BC2F
-				if (!m_in_brcond[2]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			case 0x01: // BC2T
-				if (m_in_brcond[2]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			default:
-				generate_exception(EXCEPTION_INVALIDOP);
-				break;
-			}
+			handle_cop_branch(2, op);
 			break;
 		default:
 			generate_exception(EXCEPTION_INVALIDOP);
@@ -1774,26 +1758,7 @@ void mips1core_device_base::handle_cop3(u32 const op)
 		switch (RSREG)
 		{
 		case 0x08: // BC3
-			switch (RTREG)
-			{
-			case 0x00: // BC3F
-				if (!m_in_brcond[3]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			case 0x01: // BC3T
-				if (m_in_brcond[3]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			default:
-				generate_exception(EXCEPTION_INVALIDOP);
-				break;
-			}
+			handle_cop_branch(3, op);
 			break;
 		default:
 			generate_exception(EXCEPTION_INVALIDOP);
