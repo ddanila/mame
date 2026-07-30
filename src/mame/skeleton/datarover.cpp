@@ -1198,6 +1198,9 @@ private:
 	s8 m_magicbus_host_data_endpoint = -1;
 	std::array<bool, MAGICBUS_ENDPOINTS> m_magicbus_keyboard_read_pending{};
 	bool m_magicbus_scsi_read_pending = false;
+	bool m_magicbus_scsi_write_pending = false;
+	u8 m_magicbus_scsi_requests = 0;
+	u8 m_magicbus_scsi_request_armed = 0;
 	std::array<std::array<u8, 256>, MAGICBUS_ENDPOINTS> m_magicbus_key_data{};
 	std::array<u16, MAGICBUS_ENDPOINTS> m_magicbus_key_head{};
 	std::array<u16, MAGICBUS_ENDPOINTS> m_magicbus_key_count{};
@@ -2029,7 +2032,19 @@ INPUT_CHANGED_MEMBER(datarover_state::irda_carrier_changed)
 
 INPUT_CHANGED_MEMBER(datarover_state::magicbus_scsi_request_changed)
 {
-	if (!newval || !magicbus_powered() || m_magicbus_scsi_read_pending)
+	if (!newval)
+	{
+		m_magicbus_scsi_request_armed &= ~u8(param);
+		return;
+	}
+	if (m_magicbus_scsi_request_armed & u8(param))
+		return;
+
+	m_magicbus_scsi_request_armed |= u8(param);
+	m_magicbus_scsi_requests |= u8(param);
+	if (!magicbus_powered()
+			|| m_magicbus_scsi_read_pending
+			|| m_magicbus_scsi_write_pending)
 		return;
 
 	for (unsigned endpoint = 0; endpoint < MAGICBUS_ENDPOINTS; ++endpoint)
@@ -2897,6 +2912,8 @@ void datarover_state::magicbus_command(u16 command)
 		m_magicbus_host_data_endpoint = -1;
 		m_magicbus_keyboard_read_pending.fill(false);
 		m_magicbus_scsi_read_pending = false;
+		m_magicbus_scsi_write_pending = false;
+		m_magicbus_scsi_requests = 0;
 		m_magicbus_endpoint_request.fill(false);
 		magicbus_update_request();
 		return;
@@ -3029,8 +3046,20 @@ void datarover_state::magicbus_command(u16 command)
 			m_magicbus_response_endpoint = endpoint;
 			if (magicbus_endpoint_is_keyboard(endpoint))
 				m_magicbus_keyboard_read_pending[endpoint] = true;
-			else
+			else if (!m_magicbus_scsi_read_pending
+					&& !m_magicbus_scsi_write_pending
+					&& BIT(m_magicbus_scsi_requests, 0))
+			{
+				m_magicbus_scsi_requests &= ~u8(1);
 				m_magicbus_scsi_read_pending = true;
+			}
+			else if (!m_magicbus_scsi_read_pending
+					&& !m_magicbus_scsi_write_pending
+					&& BIT(m_magicbus_scsi_requests, 1))
+			{
+				m_magicbus_scsi_requests &= ~u8(2);
+				m_magicbus_scsi_write_pending = true;
+			}
 		}
 		break;
 
@@ -3049,6 +3078,8 @@ void datarover_state::magicbus_command(u16 command)
 		if (magicbus_endpoint_is_scsi(endpoint)
 				&& m_magicbus_scsi_read_pending)
 		{
+			magicbus_set_request(endpoint, false);
+			m_magicbus_scsi_requests &= ~u8(1);
 			m_magicbus_response = MBUS_RESPONSE_SCSI;
 			m_magicbus_response_endpoint = endpoint;
 		}
@@ -3057,6 +3088,16 @@ void datarover_state::magicbus_command(u16 command)
 	case 5: // write an AT-keyboard control packet
 		if (magicbus_endpoint_is_keyboard(endpoint))
 			m_magicbus_host_data_endpoint = endpoint;
+		break;
+
+	case 7: // send monitor/PCLink transport data to an SCTG endpoint
+		if (magicbus_endpoint_is_scsi(endpoint)
+				&& m_magicbus_scsi_write_pending)
+		{
+			magicbus_set_request(endpoint, false);
+			m_magicbus_scsi_requests &= ~u8(2);
+			m_magicbus_host_data_endpoint = endpoint;
+		}
 		break;
 
 	default:
@@ -3080,10 +3121,18 @@ void datarover_state::magicbus_deliver_response()
 		return;
 	}
 	unsigned const endpoint = m_magicbus_response_endpoint;
+	if (m_magicbus_response == MBUS_RESPONSE_INFO
+			&& magicbus_endpoint_is_scsi(endpoint))
+	{
+		u8 const held = m_magicbus_scsi_request->read() & 3;
+		m_magicbus_scsi_requests |= held;
+		m_magicbus_scsi_request_armed |= held;
+	}
 	bool const request_after_info =
 			m_magicbus_response == MBUS_RESPONSE_INFO
 			&& magicbus_endpoint_is_scsi(endpoint)
-			&& m_magicbus_scsi_request->read();
+			&& m_magicbus_scsi_requests;
+	bool request_after_data = false;
 
 	std::array<u8, 88> response{};
 	unsigned response_size = 0;
@@ -3146,10 +3195,13 @@ void datarover_state::magicbus_deliver_response()
 	case MBUS_RESPONSE_REQUEST:
 	{
 		// Request kind 14 reaches MagicBusATKeyboard_PeripheralRequest.
-		// The monitor routes kind 18 to GetDataFunction for an SCTG endpoint.
+		// The monitor routes SCTG kinds 18 and 19 to GetDataFunction and
+		// SendDataFunction respectively.
 		bool const scsi = magicbus_endpoint_is_scsi(endpoint);
 		response[0] = scsi ? 4 : 0; // SCTG length in 32-bit words
-		response[1] = scsi ? 18 : 14;
+		response[1] = scsi
+				? (m_magicbus_scsi_read_pending ? 18 : 19)
+				: 14;
 		response_size = 16;
 		magicbus_set_request(endpoint, false);
 		break;
@@ -3181,6 +3233,7 @@ void datarover_state::magicbus_deliver_response()
 		// without reading or modifying target memory.
 		response_size = 16;
 		m_magicbus_scsi_read_pending = false;
+		request_after_data = m_magicbus_scsi_requests != 0;
 		break;
 
 	default:
@@ -3190,12 +3243,12 @@ void datarover_state::magicbus_deliver_response()
 	m_magicbus_response = MBUS_RESPONSE_NONE;
 	m_magicbus_response_endpoint = -1;
 
-	if (BIT(m_dino[DINO_MBUS_CONTROL1], 16))
+	unsigned const requested =
+			(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
+	if (requested > 4 || BIT(m_dino[DINO_MBUS_CONTROL1], 16))
 	{
 		address_space &space = m_maincpu->space(AS_PROGRAM);
 		u32 const start = m_dino[DINO_MBUS_DMA_START] & 0x1fff'fffc;
-		unsigned const requested =
-				(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
 		unsigned const count = std::min(response_size, requested);
 		for (unsigned offset = 0; offset < count; ++offset)
 			space.write_byte(start + offset, response[offset]);
@@ -3219,6 +3272,8 @@ void datarover_state::magicbus_deliver_response()
 
 	if (request_after_info)
 		magicbus_set_request(endpoint, true);
+	else if (request_after_data)
+		magicbus_set_request(endpoint, true);
 }
 
 
@@ -3227,7 +3282,6 @@ void datarover_state::magicbus_accept_host_data()
 	if (!magicbus_powered()
 			|| m_magicbus_host_data_endpoint < 0
 			|| m_magicbus_host_data_endpoint >= MAGICBUS_ENDPOINTS
-			|| !magicbus_endpoint_is_keyboard(m_magicbus_host_data_endpoint)
 			|| !BIT(m_dino[DINO_MBUS_CONTROL1], 15))
 		return;
 	unsigned const endpoint = m_magicbus_host_data_endpoint;
@@ -3241,7 +3295,9 @@ void datarover_state::magicbus_accept_host_data()
 	u32 const start = m_dino[DINO_MBUS_DMA_START] & 0x1fff'fffc;
 	unsigned const count =
 			(m_dino[DINO_MBUS_DMA_LENGTH] & 0x000f'fffc) + 4;
-	if (count >= 3 && space.read_byte(start) == 'K')
+	if (magicbus_endpoint_is_keyboard(endpoint)
+			&& count >= 3
+			&& space.read_byte(start) == 'K')
 	{
 		switch (space.read_byte(start + 1))
 		{
@@ -3263,6 +3319,15 @@ void datarover_state::magicbus_accept_host_data()
 				m_magicbus_keyboard->write(0xf4);
 			break;
 		}
+	}
+	else if (magicbus_endpoint_is_scsi(endpoint))
+	{
+		logerror("Magic Bus SCTG accepted %u host bytes\n", count);
+		// SendDataFunction uses command 7 to transfer a monitor/PCLink
+		// transport buffer to the target.  The target consumes the complete
+		// DMA record; interpreting that higher-level payload belongs to the
+		// external peer rather than to the Magic Bus controller.
+		m_magicbus_scsi_write_pending = false;
 	}
 
 	m_magicbus_host_data_endpoint = -1;
@@ -3518,6 +3583,8 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 			m_magicbus_host_data_endpoint = -1;
 			m_magicbus_keyboard_read_pending.fill(false);
 			m_magicbus_scsi_read_pending = false;
+			m_magicbus_scsi_write_pending = false;
+			m_magicbus_scsi_requests = 0;
 			m_magicbus_endpoint_request.fill(false);
 			m_magicbus_key_head.fill(0);
 			m_magicbus_key_count.fill(0);
@@ -3752,6 +3819,9 @@ void datarover_state::machine_start()
 	save_item(NAME(m_magicbus_response_endpoint));
 	save_item(NAME(m_magicbus_keyboard_read_pending));
 	save_item(NAME(m_magicbus_scsi_read_pending));
+	save_item(NAME(m_magicbus_scsi_write_pending));
+	save_item(NAME(m_magicbus_scsi_requests));
+	save_item(NAME(m_magicbus_scsi_request_armed));
 	save_item(NAME(m_magicbus_host_data_endpoint));
 	save_item(NAME(m_magicbus_key_data));
 	save_item(NAME(m_magicbus_key_head));
@@ -3832,6 +3902,9 @@ void datarover_state::machine_reset()
 	m_magicbus_response_endpoint = -1;
 	m_magicbus_keyboard_read_pending.fill(false);
 	m_magicbus_scsi_read_pending = false;
+	m_magicbus_scsi_write_pending = false;
+	m_magicbus_scsi_requests = 0;
+	m_magicbus_scsi_request_armed = 0;
 	m_magicbus_host_data_endpoint = -1;
 	m_magicbus_key_head.fill(0);
 	m_magicbus_key_count.fill(0);
@@ -3976,10 +4049,15 @@ static INPUT_PORTS_START(datarover840)
 
 	PORT_START("MAGICBUS_SCSI_REQUEST")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER)
-		PORT_NAME("Magic Bus SCSI request")
+		PORT_NAME("Magic Bus SCTG get-data request")
 		PORT_CHANGED_MEMBER(
 				DEVICE_SELF,
-				FUNC(datarover_state::magicbus_scsi_request_changed), 0)
+				FUNC(datarover_state::magicbus_scsi_request_changed), 1)
+	PORT_BIT(0x02, IP_ACTIVE_HIGH, IPT_OTHER)
+		PORT_NAME("Magic Bus SCTG send-data request")
+		PORT_CHANGED_MEMBER(
+				DEVICE_SELF,
+				FUNC(datarover_state::magicbus_scsi_request_changed), 2)
 
 	PORT_START("IRDA_CARRIER")
 	PORT_BIT(0x01, IP_ACTIVE_HIGH, IPT_OTHER)
