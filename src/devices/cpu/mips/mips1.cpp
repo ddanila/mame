@@ -499,6 +499,12 @@ void mips1core_device_base::execute_run()
 				case 0x0d: // BREAK
 					generate_exception(EXCEPTION_BREAK);
 					break;
+				case 0x0f: // R3900 SYNC
+					// Memory accesses and cache refills are synchronous in
+					// this interpreter, so there is nothing left to drain.
+					if (!m_multiply_to_gpr || (op & 0x03ff'ffc0))
+						generate_exception(EXCEPTION_INVALIDOP);
+					break;
 				case 0x10: // MFHI
 					divide_interlock();
 					m_r[RDREG] = m_hi;
@@ -667,7 +673,7 @@ void mips1core_device_base::execute_run()
 				 * instruction if the branch is not taken, whereas the former
 				 * execute the delay slot instruction regardless.
 				 */
-				switch (RTREG & 0x1d)
+				switch (m_multiply_to_gpr ? RTREG : (RTREG & 0x1d))
 				{
 				case 0x00: // BLTZ
 					if (s32(m_r[RSREG]) < 0)
@@ -684,20 +690,64 @@ void mips1core_device_base::execute_run()
 					}
 					break;
 				case 0x10: // BLTZAL
+					if (m_multiply_to_gpr)
+						m_r[31] = m_pc + 8;
 					if (s32(m_r[RSREG]) < 0)
 					{
 						m_branch_state = BRANCH;
 						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
+						if (!m_multiply_to_gpr)
+							m_r[31] = m_pc + 8;
 					}
 					break;
 				case 0x11: // BGEZAL
+					if (m_multiply_to_gpr)
+						m_r[31] = m_pc + 8;
 					if (s32(m_r[RSREG]) >= 0)
 					{
 						m_branch_state = BRANCH;
 						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
+						if (!m_multiply_to_gpr)
+							m_r[31] = m_pc + 8;
 					}
+					break;
+				case 0x02: // R3900 BLTZL
+					if (s32(m_r[RSREG]) < 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x03: // R3900 BGEZL
+					if (s32(m_r[RSREG]) >= 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x12: // R3900 BLTZALL
+					m_r[31] = m_pc + 8;
+					if (s32(m_r[RSREG]) < 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x13: // R3900 BGEZALL
+					m_r[31] = m_pc + 8;
+					if (s32(m_r[RSREG]) >= 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
 					break;
 				default:
 					generate_exception(EXCEPTION_INVALIDOP);
@@ -740,6 +790,50 @@ void mips1core_device_base::execute_run()
 					m_branch_state = BRANCH;
 					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
 				}
+				break;
+			case 0x14: // R3900 BEQL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (m_r[RSREG] == m_r[RTREG])
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x15: // R3900 BNEL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (m_r[RSREG] != m_r[RTREG])
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x16: // R3900 BLEZL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (s32(m_r[RSREG]) <= 0)
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x17: // R3900 BGTZL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (s32(m_r[RSREG]) > 0)
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
 				break;
 			case 0x08: // ADDI
 				{
@@ -892,6 +986,11 @@ void mips1core_device_base::execute_run()
 		case BRANCH:
 			m_branch_state = DELAY;
 			m_pc += 4;
+			break;
+
+		case NULLIFY:
+			m_branch_state = NONE;
+			m_pc += 8;
 			break;
 
 		case EXCEPTION:
@@ -1162,8 +1261,14 @@ bool mips1core_device_base::reads_gpr(u32 const op, unsigned const reg) const
 
 	case 0x04: // BEQ
 	case 0x05: // BNE
+	case 0x14: // R3900 BEQL
+	case 0x15: // R3900 BNEL
 	case 0x1c: // R3900 MADD/MADDU
 		return reads_rs() || reads_rt();
+
+	case 0x16: // R3900 BLEZL
+	case 0x17: // R3900 BGTZL
+		return reads_rs();
 
 	case 0x10: // COP0
 	case 0x11: // COP1

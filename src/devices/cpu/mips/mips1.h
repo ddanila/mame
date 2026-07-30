@@ -170,6 +170,7 @@ protected:
 		DELAY     = 1, // delay slot instruction active
 		BRANCH    = 2, // branch instruction active
 		EXCEPTION = 3, // exception triggered
+		NULLIFY   = 4, // branch-likely delay slot skipped
 	}
 	m_branch_state;
 	u32 m_branch_target;
