@@ -974,6 +974,9 @@ private:
 	static constexpr u32 DINO_ALARM_LOW = 0x14c / 4;
 	static constexpr u32 DINO_TIMER_CONTROL = 0x150 / 4;
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
+	static constexpr u32 DINO_TIMER_FREEZE_PERIODIC = 0x0000'0020;
+	static constexpr u32 DINO_TIMER_ENABLE_PERIODIC = 0x0000'0010;
+	static constexpr u32 DINO_PERIODIC_LOAD = 0x0000'ffff;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
 	static constexpr u32 DINO_MFIO_DATA_OUTPUT = 0x184 / 4;
 	static constexpr u32 DINO_MFIO_DATA_INPUT = 0x18c / 4;
@@ -1107,6 +1110,8 @@ private:
 	void telephone_bridge_transmit(u32 samples);
 	u32 telephone_bridge_receive();
 	void telephone_hookswitch_changed(bool offhook);
+	u16 periodic_count() const;
+	void pause_periodic_timer();
 	void update_periodic_timer();
 	void start_stop_timer();
 	u64 rtc_ticks() const;
@@ -1180,6 +1185,7 @@ private:
 	u64 m_rtc_base = 0;
 	u64 m_rtc_origin = 0;
 	emu_timer *m_periodic_timer = nullptr;
+	u32 m_periodic_remaining = 0;
 	emu_timer *m_stop_timer = nullptr;
 	emu_timer *m_rtc_alarm_timer = nullptr;
 	emu_timer *m_rtc_rollover_timer = nullptr;
@@ -2719,16 +2725,44 @@ TIMER_CALLBACK_MEMBER(datarover_state::telecom_tick)
 }
 
 
+u16 datarover_state::periodic_count() const
+{
+	// Dino.asm.h assigns perTimer[31:16] to the live count and [15:0] to
+	// the reload value.  A clock or explicit freeze retains the former.
+	u64 count = m_periodic_remaining;
+	if (!m_periodic_timer->remaining().is_never())
+		count = m_periodic_timer->remaining().as_ticks(32'768);
+	return u16(std::min<u64>(count, DINO_PERIODIC_LOAD));
+}
+
+
+void datarover_state::pause_periodic_timer()
+{
+	if (!m_periodic_timer->remaining().is_never())
+	{
+		m_periodic_remaining = periodic_count();
+		m_periodic_timer->reset();
+	}
+}
+
+
 void datarover_state::update_periodic_timer()
 {
-	u32 const period = m_dino[DINO_PERIODIC_TIMER];
+	u32 const load = m_dino[DINO_PERIODIC_TIMER] & DINO_PERIODIC_LOAD;
+	bool const running = dino_clock_enabled(DINO_CLOCK_TIMER)
+			&& (m_dino[DINO_TIMER_CONTROL] & DINO_TIMER_ENABLE_PERIODIC)
+			&& !(m_dino[DINO_TIMER_CONTROL] & DINO_TIMER_FREEZE_PERIODIC)
+			&& load;
 
-	if (dino_clock_enabled(DINO_CLOCK_TIMER)
-			&& BIT(m_dino[DINO_TIMER_CONTROL], 4)
-			&& period)
+	if (running)
 	{
-		attotime const interval = attotime::from_ticks(period, 32'768);
-		m_periodic_timer->adjust(interval, 0, interval);
+		if (!m_periodic_remaining || m_periodic_remaining > load)
+			m_periodic_remaining = load;
+		attotime const interval = attotime::from_ticks(load, 32'768);
+		m_periodic_timer->adjust(
+				attotime::from_ticks(m_periodic_remaining, 32'768),
+				0,
+				interval);
 	}
 	else
 	{
@@ -3458,6 +3492,10 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 	case DINO_RTC_LOW:
 		return u32(rtc_ticks());
 
+	case DINO_PERIODIC_TIMER:
+		return (u32(periodic_count()) << 16)
+				| (m_dino[offset] & DINO_PERIODIC_LOAD);
+
 	case DINO_MBUS_CONTROL1:
 		// kMbusEnabledStatusMask follows the module enable, the transmit FIFO
 		// is always empty because commands complete synchronously, and
@@ -3650,7 +3688,14 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 		u32 const old_control = m_dino[offset];
 		u64 const current_ticks = rtc_ticks();
+		pause_periodic_timer();
 		COMBINE_DATA(&m_dino[offset]);
+		if (!(old_control & DINO_TIMER_ENABLE_PERIODIC)
+				&& (m_dino[offset] & DINO_TIMER_ENABLE_PERIODIC))
+		{
+			m_periodic_remaining =
+					m_dino[DINO_PERIODIC_TIMER] & DINO_PERIODIC_LOAD;
+		}
 		if (BIT(m_dino[offset], 3))
 		{
 			m_rtc_base = 0;
@@ -3667,9 +3712,18 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 
 	case DINO_PERIODIC_TIMER:
-		COMBINE_DATA(&m_dino[offset]);
-		update_periodic_timer();
+	{
+		u32 const write_mask = mem_mask & DINO_PERIODIC_LOAD;
+		if (write_mask)
+		{
+			pause_periodic_timer();
+			m_dino[offset] = (m_dino[offset] & ~write_mask)
+					| (data & write_mask);
+			m_periodic_remaining = m_dino[offset] & DINO_PERIODIC_LOAD;
+			update_periodic_timer();
+		}
 		break;
+	}
 
 	case DINO_MFIO_DATA_OUTPUT:
 	{
@@ -3707,6 +3761,7 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	case DINO_MASTER_CLOCK:
 	{
 		u32 const old_clock = m_dino[offset];
+		pause_periodic_timer();
 		COMBINE_DATA(&m_dino[offset]);
 
 		update_periodic_timer();
@@ -3920,6 +3975,7 @@ void datarover_state::machine_start()
 	save_item(NAME(m_rtc_nvram_data));
 	save_item(NAME(m_rtc_base));
 	save_item(NAME(m_rtc_origin));
+	save_item(NAME(m_periodic_remaining));
 	save_item(NAME(m_sound_dma_half_signalled));
 	save_item(NAME(m_microphone_data));
 	save_item(NAME(m_microphone_head));
@@ -3993,6 +4049,7 @@ void datarover_state::machine_reset()
 	m_uart_rx_head.fill(0);
 	m_uart_rx_count.fill(0);
 	m_periodic_timer->reset();
+	m_periodic_remaining = 0;
 	m_stop_timer->reset();
 	m_rtc_alarm_timer->reset();
 	m_rtc_rollover_timer->reset();
