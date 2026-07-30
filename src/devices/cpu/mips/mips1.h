@@ -58,10 +58,10 @@ protected:
 	virtual unsigned cache_refill_words(bool icache) const;
 	virtual bool cache_store_allocate() const;
 
-	// TX39 multiply/divide pipeline
+	// TX39 pipeline interlocks
 	bool reads_gpr(u32 op, unsigned reg) const;
-	void multiply_gpr_interlock(u32 op);
-	void set_multiply_gpr_delay(unsigned reg);
+	void gpr_interlock(u32 op);
+	void set_gpr_delay(unsigned reg);
 	void cancel_divide();
 	void divide_interlock();
 	void advance_divide(unsigned cycles);
@@ -157,7 +157,7 @@ protected:
 	u32 m_divide_hi;
 	u32 m_divide_lo;
 	u8 m_divide_cycles;
-	u8 m_multiply_gpr_delay;
+	u8 m_gpr_delay;
 
 	// cop0 registers
 	u32 m_cop0[32];
