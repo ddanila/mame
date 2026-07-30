@@ -980,6 +980,32 @@ unsigned r3900_device::cache_refill_words(bool icache) const
 			: 1U;
 }
 
+void r3900_device::invalidate_data_cache(u32 address, u32 bytes)
+{
+	if (!bytes)
+		return;
+
+	// Dino DMA uses physical addresses while the R3900 can cache the same
+	// memory through its direct-mapped low-address segment.  Invalidate every
+	// resident word touched by the external write so the next CPU load refills
+	// it from memory.  Keep locked lines intact: DALc turns a way into on-chip
+	// scratch storage rather than ordinary coherent memory.
+	u64 const end = u64(address) + bytes;
+	for (u64 current = address & ~u32(3); current < end; current += 4)
+	{
+		u32 const word = u32(current);
+		unsigned const index = m_dcache.index(word);
+		for (unsigned way = 0; way < m_dcache.ways; ++way)
+		{
+			struct cache::line &line = m_dcache.at(index, way);
+			if (!line.locked
+					&& !((line.tag ^ word)
+							& (-m_dcache.way_size() | cache::line::INV)))
+				line.invalidate();
+		}
+	}
+}
+
 bool r3900_device::cache_store_allocate() const
 {
 	// The R3900 data cache is write-through without write allocation.
