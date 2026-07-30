@@ -1016,9 +1016,12 @@ private:
 	static constexpr u32 DINO_ON_BUTTON_NEGATIVE = 0x0040'0000;
 	static constexpr u32 DINO_POWER_ON_BUTTON_STATUS = 0x8000'0000;
 	static constexpr u32 DINO_POWER_OK_STATUS = 0x2000'0000;
+	static constexpr u32 DINO_POWER_STOP_TIMER_VALUE = 0x0000'f000;
+	static constexpr u32 DINO_POWER_STOP_TIMER_ENABLE = 0x0000'0800;
 	static constexpr u32 DINO_POWER_STOP_CPU = 0x0000'0010;
 	static constexpr u32 DINO_POWER_VCC_ON = 0x0000'0001;
 	static constexpr u32 DINO_POWER_WRITE_MASK = 0x0000'ffbf;
+	static constexpr u32 INT5_STOP_TIMER = 0x1000'0000;
 	static constexpr u32 GLACIER_IO_DATA_INPUT = 0x00c / 4;
 	static constexpr u32 GLACIER_IO_POS_ENABLE = 0x010 / 4;
 	static constexpr u32 GLACIER_IO_NEG_ENABLE = 0x014 / 4;
@@ -1105,10 +1108,12 @@ private:
 	u32 telephone_bridge_receive();
 	void telephone_hookswitch_changed(bool offhook);
 	void update_periodic_timer();
+	void start_stop_timer();
 	u64 rtc_ticks() const;
 	void persist_rtc();
 	void update_rtc_timers();
 	TIMER_CALLBACK_MEMBER(periodic_tick);
+	TIMER_CALLBACK_MEMBER(stop_timer_expired);
 	TIMER_CALLBACK_MEMBER(rtc_alarm);
 	TIMER_CALLBACK_MEMBER(rtc_rollover);
 	TIMER_CALLBACK_MEMBER(rtc_persist_tick);
@@ -1175,6 +1180,7 @@ private:
 	u64 m_rtc_base = 0;
 	u64 m_rtc_origin = 0;
 	emu_timer *m_periodic_timer = nullptr;
+	emu_timer *m_stop_timer = nullptr;
 	emu_timer *m_rtc_alarm_timer = nullptr;
 	emu_timer *m_rtc_rollover_timer = nullptr;
 	emu_timer *m_rtc_persist_timer = nullptr;
@@ -2731,6 +2737,23 @@ void datarover_state::update_periodic_timer()
 }
 
 
+void datarover_state::start_stop_timer()
+{
+	// Dino's power stop timer divides the always-on 32.768 kHz timebase by
+	// 256.  The monitor calls the corresponding interval "8msec"; its
+	// conservative wait loop uses 264 RTC ticks.  Magic Cap programs two
+	// ticks for each nominal 16 ms Betty reset phase (15.625 ms) and eight
+	// ticks for the nominal 64 ms DeepDoze DRAM-refresh interval (62.5 ms).
+	// The monitor leaves master-clock bit 14 clear while using this timer, so
+	// that separately named fast-timer clock cannot gate the power stop timer.
+	u32 const value =
+			(m_dino[DINO_POWER_CONTROL] & DINO_POWER_STOP_TIMER_VALUE) >> 12;
+	attotime const duration = attotime::from_ticks(u64(value) * 256, 32'768);
+	m_stop_timer->reset();
+	m_stop_timer->adjust(duration);
+}
+
+
 u64 datarover_state::rtc_ticks() const
 {
 	static constexpr u64 RTC_MASK = 0x0000'00ff'ffff'ffff;
@@ -2787,6 +2810,13 @@ void datarover_state::update_rtc_timers()
 TIMER_CALLBACK_MEMBER(datarover_state::periodic_tick)
 {
 	m_dino[DINO_INTERRUPT5] |= 0x2000'0000;
+	update_irq();
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::stop_timer_expired)
+{
+	m_dino[DINO_INTERRUPT5] |= INT5_STOP_TIMER;
 	update_irq();
 }
 
@@ -3700,11 +3730,16 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		u32 const write_mask = mem_mask & DINO_POWER_WRITE_MASK;
 		m_dino[offset] = (old_control & ~write_mask) | (data & write_mask);
 
-		// The low-level Betty reset uses Dino's stop timer as a short,
-		// polled delay.  Complete it synchronously until the stop timer gets
-		// its own scheduled counter.
-		if (BIT(m_dino[offset], 11))
-			m_dino[DINO_INTERRUPT5] |= 0x1000'0000;
+		if ((old_control & DINO_POWER_STOP_TIMER_ENABLE)
+				&& !(m_dino[offset] & DINO_POWER_STOP_TIMER_ENABLE))
+		{
+			m_stop_timer->reset();
+		}
+		else if (!(old_control & DINO_POWER_STOP_TIMER_ENABLE)
+				&& (m_dino[offset] & DINO_POWER_STOP_TIMER_ENABLE))
+		{
+			start_stop_timer();
+		}
 		if (BIT(m_dino[offset], 10) && BIT(m_dino[offset], 9))
 		{
 			// Force shutdown follows Magic Cap's heap/vault preparation.
@@ -3844,6 +3879,7 @@ void datarover_state::machine_start()
 	}
 
 	m_periodic_timer = timer_alloc(FUNC(datarover_state::periodic_tick), this);
+	m_stop_timer = timer_alloc(FUNC(datarover_state::stop_timer_expired), this);
 	m_rtc_alarm_timer = timer_alloc(FUNC(datarover_state::rtc_alarm), this);
 	m_rtc_rollover_timer = timer_alloc(FUNC(datarover_state::rtc_rollover), this);
 	m_rtc_persist_timer = timer_alloc(FUNC(datarover_state::rtc_persist_tick), this);
@@ -3957,6 +3993,7 @@ void datarover_state::machine_reset()
 	m_uart_rx_head.fill(0);
 	m_uart_rx_count.fill(0);
 	m_periodic_timer->reset();
+	m_stop_timer->reset();
 	m_rtc_alarm_timer->reset();
 	m_rtc_rollover_timer->reset();
 	m_rtc_persist_timer->adjust(attotime::from_seconds(1), 0, attotime::from_seconds(1));
