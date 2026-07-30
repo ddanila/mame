@@ -1051,6 +1051,17 @@ void mips1core_device_base::execute_run()
 				else
 					generate_exception(EXCEPTION_BADCOP0);
 				break;
+			case 0x30: // R3900 reserved LWC0
+			case 0x38: // R3900 reserved SWC0
+				// Coprocessor Unusable has priority over Reserved
+				// Instruction when user mode has disabled CP0.
+				if (m_multiply_to_gpr
+						&& (SR & SR_KUc)
+						&& !(SR & SR_COP0))
+					generate_exception(EXCEPTION_BADCOP0);
+				else
+					generate_exception(EXCEPTION_INVALIDOP);
+				break;
 			case 0x31: // LWC1
 				handle_cop1(op);
 				break;
@@ -1747,6 +1758,16 @@ void mips1core_device_base::handle_cop0(u32 const op)
 	case 0x10: // COP0
 		switch (op & 31)
 		{
+			case 0x01: // R3900 TLBR
+			case 0x02: // R3900 TLBWI
+			case 0x06: // R3900 TLBWR
+			case 0x08: // R3900 TLBP
+				// The R3900 has no TLB and explicitly treats these exact
+				// inherited R3000A encodings as no-ops.
+				if (!m_multiply_to_gpr
+						|| op != (0x4200'0000 | (op & 31)))
+					generate_exception(EXCEPTION_INVALIDOP);
+				break;
 			case 0x10: // RFE
 				handle_rfe();
 				break;
