@@ -23,8 +23,8 @@
     stubs derived from the matching unstripped Icras SDK ELF.
 
     TODO:
-      - add the remaining TX39-specific CP0 and MAC behaviour
-      - replace Dino register shadows with functional devices
+      - recover Dino external-bus timing from real hardware
+      - model consumer IR, SPI and CHI when hardware evidence becomes available
 
 ***************************************************************************/
 
@@ -884,9 +884,15 @@ private:
 	static constexpr u32 DINO_MEMORY_CS0_32_BIT = 0x0000'0001;
 	static constexpr u32 DINO_UART_A_CONTROL1 = 0x0b0 / 4;
 	static constexpr u32 DINO_UART_A_CONTROL2 = 0x0b4 / 4;
+	static constexpr u32 DINO_UART_A_DMA_START = 0x0b8 / 4;
+	static constexpr u32 DINO_UART_A_DMA_LENGTH = 0x0bc / 4;
+	static constexpr u32 DINO_UART_A_DMA_COUNT = 0x0c0 / 4;
 	static constexpr u32 DINO_UART_A_HOLD = 0x0c4 / 4;
 	static constexpr u32 DINO_UART_B_CONTROL1 = 0x0c8 / 4;
 	static constexpr u32 DINO_UART_B_CONTROL2 = 0x0cc / 4;
+	static constexpr u32 DINO_UART_B_DMA_START = 0x0d0 / 4;
+	static constexpr u32 DINO_UART_B_DMA_LENGTH = 0x0d4 / 4;
+	static constexpr u32 DINO_UART_B_DMA_COUNT = 0x0d8 / 4;
 	static constexpr u32 DINO_UART_B_HOLD = 0x0dc / 4;
 	static constexpr u32 DINO_UART_ENABLED_STATUS = 0x8000'0000;
 	static constexpr u32 DINO_UART_EMPTY_STATUS = 0x4000'0000;
@@ -895,7 +901,14 @@ private:
 	static constexpr u32 DINO_UART_STATUS =
 			DINO_UART_ENABLED_STATUS | DINO_UART_EMPTY_STATUS
 			| DINO_UART_PRX_HOLD_FULL | DINO_UART_RX_HOLD_FULL;
+	static constexpr u32 DINO_UART_DMA_RX = 0x0000'8000;
+	static constexpr u32 DINO_UART_DMA_TX = 0x0000'4000;
+	static constexpr u32 DINO_UART_DMA_LOOP = 0x0000'0400;
 	static constexpr u32 DINO_UART_PULSED_MODE = 0x0000'0300;
+	static constexpr std::array<u32, 2> INT2_UART_DMA_END{
+			0x0080'0000, 0x0000'2000 };
+	static constexpr std::array<u32, 2> INT2_UART_DMA_HALF{
+			0x0040'0000, 0x0000'1000 };
 	static constexpr u32 DINO_SIB_SF0_AUX = 0x080 / 4;
 	static constexpr u32 DINO_SIB_SF1_AUX = 0x084 / 4;
 	static constexpr u32 DINO_SIB_SF0_STATUS = 0x088 / 4;
@@ -1088,6 +1101,9 @@ private:
 	u32 uart_interrupt_r() const;
 	u32 uart_control_r(unsigned channel) const;
 	void uart_configure(unsigned channel);
+	void uart_dma_update(unsigned channel);
+	bool uart_dma_receive(unsigned channel, u8 data);
+	void uart_transmit(unsigned channel, u8 data, bool dma);
 	u32 uart_hold_r(unsigned channel);
 	void uart_hold_w(unsigned channel, u32 data, u32 mem_mask);
 	bool uart_pulsed(unsigned channel) const;
@@ -1130,6 +1146,7 @@ private:
 	TIMER_CALLBACK_MEMBER(rtc_alarm);
 	TIMER_CALLBACK_MEMBER(rtc_rollover);
 	TIMER_CALLBACK_MEMBER(rtc_persist_tick);
+	TIMER_CALLBACK_MEMBER(uart_dma_tick);
 	TIMER_CALLBACK_MEMBER(sib_tick);
 	TIMER_CALLBACK_MEMBER(telecom_tick);
 	TIMER_CALLBACK_MEMBER(telephone_pulse_digit);
@@ -1183,6 +1200,7 @@ private:
 	std::array<std::array<u8, UART_RX_QUEUE_SIZE>, 2> m_uart_rx_data{};
 	std::array<u32, 2> m_uart_rx_head{};
 	std::array<u32, 2> m_uart_rx_count{};
+	std::array<emu_timer *, 2> m_uart_dma_timer{};
 	std::array<bool, 2> m_pccard_cd1{ true, true };
 	std::array<bool, 2> m_pccard_cd2{ true, true };
 	std::array<bool, 2> m_pccard_ready{ true, true };
@@ -1584,6 +1602,152 @@ void datarover_state::uart_configure(unsigned channel)
 	m_uart[channel]->configure(
 			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1],
 			m_dino[channel ? DINO_UART_B_CONTROL2 : DINO_UART_A_CONTROL2]);
+	uart_dma_update(channel);
+}
+
+
+void datarover_state::uart_dma_update(unsigned channel)
+{
+	u32 const control =
+			m_dino[channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1];
+	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	if (BIT(control, 0)
+			&& (control & DINO_UART_DMA_TX)
+			&& dino_clock_enabled(clock))
+	{
+		m_uart_dma_timer[channel]->adjust(attotime::zero, channel);
+	}
+	else
+	{
+		m_uart_dma_timer[channel]->reset();
+	}
+}
+
+
+bool datarover_state::uart_dma_receive(unsigned channel, u8 data)
+{
+	u32 const control_index =
+			channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1;
+	u32 const start_index =
+			channel ? DINO_UART_B_DMA_START : DINO_UART_A_DMA_START;
+	u32 const length_index =
+			channel ? DINO_UART_B_DMA_LENGTH : DINO_UART_A_DMA_LENGTH;
+	u32 const count_index =
+			channel ? DINO_UART_B_DMA_COUNT : DINO_UART_A_DMA_COUNT;
+	u32 &control = m_dino[control_index];
+	if (!BIT(control, 0) || !(control & DINO_UART_DMA_RX))
+		return false;
+
+	u32 const count = m_dino[count_index] & 0xffff;
+	u32 const length = m_dino[length_index] & 0xffff;
+	u32 const address = (m_dino[start_index] & 0x1fff'fffc) + count;
+	m_maincpu->space(AS_PROGRAM).write_byte(address, data);
+	m_maincpu->invalidate_data_cache(address, 1);
+
+	if ((count + 1) == ((length + 1) / 2))
+		m_dino[DINO_INTERRUPT2] |= INT2_UART_DMA_HALF[channel];
+
+	if (count == length)
+	{
+		m_dino[DINO_INTERRUPT2] |= INT2_UART_DMA_END[channel];
+		if (control & DINO_UART_DMA_LOOP)
+			m_dino[count_index] = 0;
+		else
+			control &= ~DINO_UART_DMA_RX;
+	}
+	else
+	{
+		m_dino[count_index] = count + 1;
+	}
+
+	logerror(
+			"UART%c DMA RX[%u/%u]: %02x\n",
+			'A' + channel,
+			count,
+			length,
+			data);
+	return true;
+}
+
+
+void datarover_state::uart_transmit(unsigned channel, u8 data, bool dma)
+{
+	bool const pulsed = uart_pulsed(channel);
+	if (pulsed)
+	{
+		m_irda->transmit(data);
+	}
+	else
+	{
+		m_terminal->write(data);
+		if (m_rs232[channel]->get_card_device())
+			m_uart[channel]->transmit(data);
+	}
+
+	if (!dma)
+		m_dino[DINO_INTERRUPT2] |= channel ? 0x0001'0000 : 0x0400'0000;
+	logerror(
+			"UART%c%s%s TX: %02x %c\n",
+			'A' + channel,
+			pulsed ? " IrDA" : "",
+			dma ? " DMA" : "",
+			data,
+			(data >= 0x20 && data < 0x7f) ? data : '.');
+}
+
+
+TIMER_CALLBACK_MEMBER(datarover_state::uart_dma_tick)
+{
+	unsigned const channel = param;
+	u32 const control_index =
+			channel ? DINO_UART_B_CONTROL1 : DINO_UART_A_CONTROL1;
+	u32 const control2_index =
+			channel ? DINO_UART_B_CONTROL2 : DINO_UART_A_CONTROL2;
+	u32 const start_index =
+			channel ? DINO_UART_B_DMA_START : DINO_UART_A_DMA_START;
+	u32 const length_index =
+			channel ? DINO_UART_B_DMA_LENGTH : DINO_UART_A_DMA_LENGTH;
+	u32 const count_index =
+			channel ? DINO_UART_B_DMA_COUNT : DINO_UART_A_DMA_COUNT;
+	u32 &control = m_dino[control_index];
+	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
+	if (!BIT(control, 0)
+			|| !(control & DINO_UART_DMA_TX)
+			|| !dino_clock_enabled(clock))
+		return;
+
+	u32 const count = m_dino[count_index] & 0xffff;
+	u32 const length = m_dino[length_index] & 0xffff;
+	u32 const address = (m_dino[start_index] & 0x1fff'fffc) + count;
+	uart_transmit(channel, m_maincpu->space(AS_PROGRAM).read_byte(address), true);
+
+	if ((count + 1) == ((length + 1) / 2))
+		m_dino[DINO_INTERRUPT2] |= INT2_UART_DMA_HALF[channel];
+
+	if (count == length)
+	{
+		m_dino[DINO_INTERRUPT2] |= INT2_UART_DMA_END[channel];
+		if (control & DINO_UART_DMA_LOOP)
+			m_dino[count_index] = 0;
+		else
+			control &= ~DINO_UART_DMA_TX;
+	}
+	else
+	{
+		m_dino[count_index] = count + 1;
+	}
+	update_irq();
+
+	if (control & DINO_UART_DMA_TX)
+	{
+		u32 const bits =
+				1 + (BIT(control, 3) ? 7 : 8)
+				+ BIT(control, 1) + (BIT(control, 5) ? 2 : 1);
+		u32 const divisor = (m_dino[control2_index] & 0x03ff) + 1;
+		m_uart_dma_timer[channel]->adjust(
+				attotime::from_ticks(bits * divisor, 230'400),
+				channel);
+	}
 }
 
 
@@ -1609,27 +1773,9 @@ u32 datarover_state::uart_hold_r(unsigned channel)
 void datarover_state::uart_hold_w(unsigned channel, u32 data, u32 mem_mask)
 {
 	u32 const clock = channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
-	bool const pulsed = uart_pulsed(channel);
 	if (ACCESSING_BITS_0_7 && dino_clock_enabled(clock))
 	{
-		u8 const character = data;
-		if (pulsed)
-		{
-			m_irda->transmit(character);
-		}
-		else
-		{
-			m_terminal->write(character);
-			if (m_rs232[channel]->get_card_device())
-				m_uart[channel]->transmit(character);
-		}
-		m_dino[DINO_INTERRUPT2] |= channel ? 0x0001'0000 : 0x0400'0000;
-		logerror(
-				"UART%c%s TX: %02x %c\n",
-				'A' + channel,
-				pulsed ? " IrDA" : "",
-				character,
-				(character >= 0x20 && character < 0x7f) ? character : '.');
+		uart_transmit(channel, data, false);
 		update_irq();
 	}
 }
@@ -1674,6 +1820,12 @@ void datarover_state::uart_received(u8 data)
 	u32 const clock = Channel ? DINO_CLOCK_UART_B : DINO_CLOCK_UART_A;
 	if (!dino_clock_enabled(clock))
 		return;
+
+	if (uart_dma_receive(Channel, data))
+	{
+		update_irq();
+		return;
+	}
 
 	if (m_uart_rx_count[Channel] < UART_RX_QUEUE_SIZE)
 	{
@@ -3612,15 +3764,47 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 	{
 	case DINO_UART_A_CONTROL1:
 	case DINO_UART_B_CONTROL1:
+	{
+		unsigned const channel = offset == DINO_UART_B_CONTROL1;
+		u32 const old_control = m_dino[offset];
 		COMBINE_DATA(&m_dino[offset]);
 		m_dino[offset] &= ~DINO_UART_STATUS;
-		uart_configure(offset == DINO_UART_B_CONTROL1);
+		if ((~old_control & m_dino[offset])
+				& (DINO_UART_DMA_RX | DINO_UART_DMA_TX))
+			m_dino[channel ? DINO_UART_B_DMA_COUNT : DINO_UART_A_DMA_COUNT] = 0;
+		uart_configure(channel);
 		break;
+	}
 
 	case DINO_UART_A_CONTROL2:
 	case DINO_UART_B_CONTROL2:
 		COMBINE_DATA(&m_dino[offset]);
 		uart_configure(offset == DINO_UART_B_CONTROL2);
+		break;
+
+	case DINO_UART_A_DMA_START:
+	case DINO_UART_B_DMA_START:
+	{
+		u32 const write_mask = mem_mask & 0xffff'fffc;
+		m_dino[offset] =
+				(m_dino[offset] & ~write_mask) | (data & write_mask);
+		uart_dma_update(offset == DINO_UART_B_DMA_START);
+		break;
+	}
+
+	case DINO_UART_A_DMA_LENGTH:
+	case DINO_UART_B_DMA_LENGTH:
+	{
+		u32 const write_mask = mem_mask & 0x0000'ffff;
+		m_dino[offset] =
+				(m_dino[offset] & ~write_mask) | (data & write_mask);
+		uart_dma_update(offset == DINO_UART_B_DMA_LENGTH);
+		break;
+	}
+
+	case DINO_UART_A_DMA_COUNT:
+	case DINO_UART_B_DMA_COUNT:
+		// The current byte index is maintained by hardware.
 		break;
 
 	case DINO_UART_A_HOLD:
@@ -3837,6 +4021,8 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 
 		update_periodic_timer();
 		update_sib_timers();
+		uart_dma_update(0);
+		uart_dma_update(1);
 
 		if (!(old_clock & DINO_CLOCK_MBUS)
 				&& dino_clock_enabled(DINO_CLOCK_MBUS)
@@ -4009,6 +4195,9 @@ void datarover_state::machine_start()
 	m_rtc_alarm_timer = timer_alloc(FUNC(datarover_state::rtc_alarm), this);
 	m_rtc_rollover_timer = timer_alloc(FUNC(datarover_state::rtc_rollover), this);
 	m_rtc_persist_timer = timer_alloc(FUNC(datarover_state::rtc_persist_tick), this);
+	for (unsigned channel = 0; channel < m_uart_dma_timer.size(); ++channel)
+		m_uart_dma_timer[channel] =
+				timer_alloc(FUNC(datarover_state::uart_dma_tick), this);
 	m_sib_timer = timer_alloc(FUNC(datarover_state::sib_tick), this);
 	m_sound_timer = timer_alloc(FUNC(datarover_state::sound_tick), this);
 	m_telecom_timer = timer_alloc(FUNC(datarover_state::telecom_tick), this);
@@ -4122,6 +4311,8 @@ void datarover_state::machine_reset()
 		data.fill(0);
 	m_uart_rx_head.fill(0);
 	m_uart_rx_count.fill(0);
+	for (emu_timer *timer : m_uart_dma_timer)
+		timer->reset();
 	m_periodic_timer->reset();
 	m_periodic_remaining = 0;
 	m_stop_timer->reset();
