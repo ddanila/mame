@@ -222,7 +222,7 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_divide_hi(0)
 	, m_divide_lo(0)
 	, m_divide_cycles(0)
-	, m_multiply_gpr_delay(0)
+	, m_gpr_delay(0)
 	, m_icount(0)
 	, m_icache(icache_size)
 	, m_dcache(dcache_size, dcache_ways)
@@ -350,7 +350,7 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_divide_hi));
 	save_item(NAME(m_divide_lo));
 	save_item(NAME(m_divide_cycles));
-	save_item(NAME(m_multiply_gpr_delay));
+	save_item(NAME(m_gpr_delay));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -407,7 +407,7 @@ void mips1core_device_base::device_reset()
 	m_pc = 0xbfc00000;
 	m_branch_state = NONE;
 	m_divide_cycles = 0;
-	m_multiply_gpr_delay = 0;
+	m_gpr_delay = 0;
 	m_icache.reset();
 	m_dcache.reset();
 
@@ -455,11 +455,10 @@ void mips1core_device_base::execute_run()
 				return;
 			}
 
-			// A three-operand TX39 multiply writes its GPR one pipeline stage
-			// later.  Only an immediately following dependent instruction
-			// stalls; independent instructions and HI/LO consumers continue
-			// at one instruction per cycle.
-			multiply_gpr_interlock(op);
+			// A TX39 load or three-operand multiply writes its GPR one pipeline
+			// stage later.  Only an immediately following dependent instruction
+			// stalls; independent instructions continue at one per cycle.
+			gpr_interlock(op);
 
 			// decode and execute instruction
 			switch (op >> 26)
@@ -525,7 +524,7 @@ void mips1core_device_base::execute_run()
 						if (m_multiply_to_gpr)
 						{
 							m_r[RDREG] = m_lo;
-							set_multiply_gpr_delay(RDREG);
+							set_gpr_delay(RDREG);
 						}
 						else
 							m_icount -= 11;
@@ -540,7 +539,7 @@ void mips1core_device_base::execute_run()
 						if (m_multiply_to_gpr)
 						{
 							m_r[RDREG] = m_lo;
-							set_multiply_gpr_delay(RDREG);
+							set_gpr_delay(RDREG);
 						}
 						else
 							m_icount -= 11;
@@ -793,22 +792,42 @@ void mips1core_device_base::execute_run()
 				handle_special2(op);
 				break;
 			case 0x20: // LB
-				load<u8>(SIMMVAL + m_r[RSREG], [this, op](s8 temp) { m_r[RTREG] = temp; });
+				load<u8>(SIMMVAL + m_r[RSREG], [this, op](s8 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x21: // LH
-				load<u16>(SIMMVAL + m_r[RSREG], [this, op](s16 temp) { m_r[RTREG] = temp; });
+				load<u16>(SIMMVAL + m_r[RSREG], [this, op](s16 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x22: // LWL
 				lwl(op);
 				break;
 			case 0x23: // LW
-				load<u32>(SIMMVAL + m_r[RSREG], [this, op](u32 temp) { m_r[RTREG] = temp; });
+				load<u32>(SIMMVAL + m_r[RSREG], [this, op](u32 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x24: // LBU
-				load<u8>(SIMMVAL + m_r[RSREG], [this, op](u8 temp) { m_r[RTREG] = temp; });
+				load<u8>(SIMMVAL + m_r[RSREG], [this, op](u8 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x25: // LHU
-				load<u16>(SIMMVAL + m_r[RSREG], [this, op](u16 temp) { m_r[RTREG] = temp; });
+				load<u16>(SIMMVAL + m_r[RSREG], [this, op](u16 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x26: // LWR
 				lwr(op);
@@ -1181,18 +1200,18 @@ bool mips1core_device_base::reads_gpr(u32 const op, unsigned const reg) const
 	}
 }
 
-void mips1core_device_base::multiply_gpr_interlock(u32 const op)
+void mips1core_device_base::gpr_interlock(u32 const op)
 {
-	if (m_multiply_gpr_delay && reads_gpr(op, m_multiply_gpr_delay))
+	if (m_gpr_delay && reads_gpr(op, m_gpr_delay))
 		m_icount--;
 
-	m_multiply_gpr_delay = 0;
+	m_gpr_delay = 0;
 }
 
-void mips1core_device_base::set_multiply_gpr_delay(unsigned const reg)
+void mips1core_device_base::set_gpr_delay(unsigned const reg)
 {
 	if (m_multiply_to_gpr)
-		m_multiply_gpr_delay = reg;
+		m_gpr_delay = reg;
 }
 
 void mips1core_device_base::cancel_divide()
@@ -1329,7 +1348,7 @@ void r3900_device::handle_special2(u32 const op)
 	m_hi = u32(result >> 32);
 	m_r[RDREG] = m_lo;
 
-	set_multiply_gpr_delay(RDREG);
+	set_gpr_delay(RDREG);
 }
 
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
@@ -1340,9 +1359,9 @@ std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembl
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
 	// An exception flushes the integer pipeline.  A TX39 divide continues in
-	// its independent unit, but a one-cycle multiply-to-GPR dependency does
-	// not carry into the exception handler.
-	m_multiply_gpr_delay = 0;
+	// its independent unit, but a one-cycle GPR dependency does not carry into
+	// the exception handler.
+	m_gpr_delay = 0;
 
 	// set the exception PC
 	m_cop0[COP0_EPC] = m_pc;
@@ -1595,6 +1614,7 @@ void mips1core_device_base::lwl(u32 const op)
 		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 3 : 0)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU << shift)) | (temp << shift);
+		set_gpr_delay(RTREG);
 	});
 }
 
@@ -1606,6 +1626,7 @@ void mips1core_device_base::lwr(u32 const op)
 		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 0 : 3)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU >> shift)) | (temp >> shift);
+		set_gpr_delay(RTREG);
 	});
 }
 
