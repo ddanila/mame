@@ -55,6 +55,7 @@ protected:
 	virtual void handle_special2(u32 const op);
 	virtual void handle_cache(u32 const op);
 	virtual bool cache_auto_lock(bool icache) const;
+	virtual unsigned cache_refill_words(bool icache) const;
 	virtual bool cache_store_allocate() const;
 
 	// load/store left/right opcodes
@@ -129,6 +130,7 @@ protected:
 	};
 	std::tuple<struct cache::line &, bool> cache_lookup(u32 address, bool invalidate, bool icache = false);
 	void cache_lock(u32 address, bool icache = false);
+	bool cache_refill(u32 address, bool icache);
 
 	// address spaces
 	address_space_config const m_program_config_be;
@@ -298,6 +300,7 @@ protected:
 	virtual void handle_special2(u32 const op) override;
 	virtual void handle_cache(u32 const op) override;
 	virtual bool cache_auto_lock(bool icache) const override;
+	virtual unsigned cache_refill_words(bool icache) const override;
 	virtual bool cache_store_allocate() const override;
 };
 
