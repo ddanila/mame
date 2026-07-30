@@ -74,6 +74,8 @@ constexpr u8 COP0_Status   = 12;
 constexpr u8 COP0_Cause    = 13;
 constexpr u8 COP0_EPC      = 14;
 constexpr u8 COP0_PRId     = 15;
+constexpr u8 COP0_Debug    = 16; // r3900 only
+constexpr u8 COP0_DEPC     = 17; // r3900 only
 
 enum sr_mask : u32
 {
@@ -126,6 +128,16 @@ enum cause_mask : u32
 	CAUSE_BD      = 0x80000000, // branch delay
 
 	CAUSE_IPEX    = 0x0000fc00, // external interrupt pending
+};
+
+enum debug_mask : u32
+{
+	DEBUG_DBD = 0x8000'0000, // debug branch delay
+	DEBUG_DM  = 0x4000'0000, // debug mode
+	DEBUG_BSF = 0x0000'0400, // bus error exception flag
+	DEBUG_SST = 0x0000'0100, // single step enable
+	DEBUG_DBP = 0x0000'0002, // debug breakpoint
+	DEBUG_DSS = 0x0000'0001, // debug single step
 };
 
 enum entryhi_mask : u32
@@ -223,6 +235,7 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_divide_lo(0)
 	, m_divide_cycles(0)
 	, m_gpr_delay(0)
+	, m_debug_step_suppress(false)
 	, m_icount(0)
 	, m_icache(icache_size)
 	, m_dcache(dcache_size, dcache_ways)
@@ -300,6 +313,8 @@ void r3900_device::device_start()
 
 	state_add(MIPS1_COP0 + COP0_Config, "Config", m_cop0[COP0_Config]);
 	state_add(MIPS1_COP0 + COP0_Cache, "Cache", m_cop0[COP0_Cache]);
+	state_add(MIPS1_COP0 + COP0_Debug, "Debug", m_cop0[COP0_Debug]);
+	state_add(MIPS1_COP0 + COP0_DEPC, "DEPC", m_cop0[COP0_DEPC]);
 }
 
 void r3900_device::device_reset()
@@ -311,6 +326,8 @@ void r3900_device::device_reset()
 	// all cache auto-lock modes are clear.
 	m_cop0[COP0_Config] = 0x0010'0030;
 	m_cop0[COP0_Cache] = 0;
+	m_cop0[COP0_Debug] = 0;
+	m_cop0[COP0_DEPC] = 0;
 	set_clock_scale(1.0);
 }
 
@@ -351,6 +368,7 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_divide_lo));
 	save_item(NAME(m_divide_cycles));
 	save_item(NAME(m_gpr_delay));
+	save_item(NAME(m_debug_step_suppress));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -382,6 +400,7 @@ void mips1core_device_base::state_import(device_state_entry const &entry)
 	{
 		m_branch_state = NONE;
 		m_branch_target = 0;
+		m_debug_step_suppress = false;
 	}
 }
 
@@ -408,6 +427,7 @@ void mips1core_device_base::device_reset()
 	m_branch_state = NONE;
 	m_divide_cycles = 0;
 	m_gpr_delay = 0;
+	m_debug_step_suppress = false;
 	m_icache.reset();
 	m_dcache.reset();
 
@@ -432,13 +452,24 @@ void mips1core_device_base::execute_run()
 	{
 		int const cycle_start = m_icount;
 		bool divide_started = false;
+		bool const debug_step_suppressed = m_debug_step_suppress;
 
 		// debugging
 		debugger_instruction_hook(m_pc);
 
-		// fetch instruction
-		fetch(m_pc, [this, &divide_started](u32 const op)
+		if (m_multiply_to_gpr
+				&& !debug_step_suppressed
+				&& (m_branch_state != DELAY)
+				&& (m_cop0[COP0_Debug] & DEBUG_SST)
+				&& !(m_cop0[COP0_Debug] & DEBUG_DM))
 		{
+			generate_debug_exception(DEBUG_DSS);
+		}
+		else
+		{
+			// fetch instruction
+			fetch(m_pc, [this, &divide_started](u32 const op)
+			{
 			// check for interrupts
 			if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
 			{
@@ -498,6 +529,12 @@ void mips1core_device_base::execute_run()
 					break;
 				case 0x0d: // BREAK
 					generate_exception(EXCEPTION_BREAK);
+					break;
+				case 0x0e: // R3900 SDBBP
+					if (m_multiply_to_gpr)
+						generate_debug_exception(DEBUG_DBP);
+					else
+						generate_exception(EXCEPTION_INVALIDOP);
 					break;
 				case 0x0f: // R3900 SYNC
 					// Memory accesses and cache refills are synchronous in
@@ -969,7 +1006,8 @@ void mips1core_device_base::execute_run()
 
 			// clear register 0
 			m_r[0] = 0;
-		});
+			});
+		}
 
 		// update pc and branch state
 		switch (m_branch_state)
@@ -997,6 +1035,11 @@ void mips1core_device_base::execute_run()
 			m_branch_state = NONE;
 			break;
 		}
+
+		// DERET suppresses single-step at its return destination and, when
+		// that instruction branches, through its delay slot as well.
+		if (debug_step_suppressed)
+			m_debug_step_suppress = m_branch_state == DELAY;
 
 		// The R3900 divider runs beside the integer pipeline.  Account for
 		// every elapsed core cycle, including another pipeline interlock, but
@@ -1117,6 +1160,8 @@ u32 r3900_device::get_cop0_reg(unsigned const reg)
 	{
 	case COP0_Config:
 	case COP0_Cache:
+	case COP0_Debug:
+	case COP0_DEPC:
 		return m_cop0[reg];
 
 	default:
@@ -1148,6 +1193,17 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 		m_cop0[COP0_Cache] = data & 0x0000'3f00;
 		break;
 
+	case COP0_Debug:
+		// SSt and BsF are the only software-writable Debug fields.
+		m_cop0[COP0_Debug] =
+				(m_cop0[COP0_Debug] & ~(DEBUG_BSF | DEBUG_SST))
+				| (data & (DEBUG_BSF | DEBUG_SST));
+		break;
+
+	case COP0_DEPC:
+		m_cop0[COP0_DEPC] = data;
+		break;
+
 	default:
 		mips1core_device_base::set_cop0_reg(reg, data);
 		break;
@@ -1156,8 +1212,11 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 
 bool r3900_device::cache_auto_lock(bool icache) const
 {
-	// The implemented TX39 configuration reserves instruction auto-lock.
-	return !icache && BIT(m_cop0[COP0_Cache], 8);
+	// Debug mode forces cache auto-lock off.  The implemented TX39
+	// configuration reserves instruction auto-lock.
+	return !(m_cop0[COP0_Debug] & DEBUG_DM)
+			&& !icache
+			&& BIT(m_cop0[COP0_Cache], 8);
 }
 
 unsigned r3900_device::cache_refill_words(bool icache) const
@@ -1461,6 +1520,25 @@ std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembl
 	return std::make_unique<mips1_disassembler>(m_multiply_to_gpr);
 }
 
+void mips1core_device_base::generate_debug_exception(u32 const cause)
+{
+	// Debug exceptions use their own state and vector.  Ordinary Status,
+	// Cause and EPC state is deliberately left untouched.
+	m_gpr_delay = 0;
+	m_cop0[COP0_DEPC] = m_pc;
+
+	u32 debug = m_cop0[COP0_Debug] & (DEBUG_BSF | DEBUG_SST);
+	if (m_branch_state == DELAY)
+	{
+		m_cop0[COP0_DEPC] -= 4;
+		debug |= DEBUG_DBD;
+	}
+
+	m_cop0[COP0_Debug] = debug | DEBUG_DM | cause;
+	m_branch_state = EXCEPTION;
+	m_pc = 0xbfc0'0200;
+}
+
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
 	// An exception flushes the integer pipeline.  A TX39 divide continues in
@@ -1555,6 +1633,21 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		{
 			case 0x10: // RFE
 				handle_rfe();
+				break;
+			case 0x1f: // R3900 DERET
+				if (m_multiply_to_gpr && (m_cop0[COP0_Debug] & DEBUG_DM))
+				{
+					m_pc = m_cop0[COP0_DEPC];
+					m_branch_state = EXCEPTION;
+					m_cop0[COP0_Debug] &= ~DEBUG_DM;
+					bool const was_user = bool(SR & SR_KUc);
+					SR |= SR_KUc | SR_IEc;
+					if (!was_user)
+						debugger_privilege_hook();
+					m_debug_step_suppress = true;
+				}
+				else
+					generate_exception(EXCEPTION_INVALIDOP);
 				break;
 			default:
 				generate_exception(EXCEPTION_INVALIDOP);

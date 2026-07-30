@@ -1271,9 +1271,9 @@ void datarover_state::memory_map(address_map &map)
 			FUNC(datarover_state::vector_page_w));
 	map(0x13e96600, 0x143fffff).rom().region("maincpu", 0x00296600);
 
-	// Architectural reset vector alias.  Only the first word and delay slot
-	// are required before the ROM jumps to its normal 0xb3c00000 alias.
-	map(0x1fc00000, 0x1fc00007).rom().region("maincpu", 0);
+	// Architectural boot-vector alias, including the general exception
+	// vector at +0x180 and the R3900 debug exception vector at +0x200.
+	map(0x1fc00000, 0x1fc003ff).rom().region("maincpu", 0);
 }
 
 
@@ -1290,7 +1290,7 @@ void datarover_state::flash_memory_map(address_map &map)
 	map(0x13e96600, 0x143fffff).rw(
 			FUNC(datarover_state::flash_r<0x00296600>),
 			FUNC(datarover_state::flash_w<0x00296600>));
-	map(0x1fc00000, 0x1fc00007).rw(
+	map(0x1fc00000, 0x1fc003ff).rw(
 			FUNC(datarover_state::flash_r<0>),
 			FUNC(datarover_state::flash_w<0>));
 }
