@@ -39,6 +39,7 @@ protected:
 
 	// exceptions
 	void generate_exception(u32 exception, bool refill = false);
+	void generate_debug_exception(u32 cause);
 	void address_error(int intention, u32 const address);
 	virtual void exception_enter();
 
@@ -158,6 +159,7 @@ protected:
 	u32 m_divide_lo;
 	u8 m_divide_cycles;
 	u8 m_gpr_delay;
+	bool m_debug_step_suppress;
 
 	// cop0 registers
 	u32 m_cop0[32];

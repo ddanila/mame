@@ -97,12 +97,23 @@ uint32_t mips1_disassembler::dasm_cop(uint32_t pc, int cop, uint32_t op, std::os
 	int rt = (op >> 16) & 31;
 	int rd = (op >> 11) & 31;
 	uint32_t flags = 0;
+	char const *cp_name = cpreg[cop][rd];
+	if (m_multiply_to_gpr && cop == 0)
+	{
+		switch (rd)
+		{
+		case 3:  cp_name = "Config"; break;
+		case 7:  cp_name = "Cache";  break;
+		case 16: cp_name = "Debug";  break;
+		case 17: cp_name = "DEPC";   break;
+		}
+	}
 
 	switch ((op >> 21) & 31)
 	{
-		case 0x00:  util::stream_format(stream, "mfc%d   %s,%s", cop, reg[rt], cpreg[cop][rd]);                 break;
+		case 0x00:  util::stream_format(stream, "mfc%d   %s,%s", cop, reg[rt], cp_name);                        break;
 		case 0x02:  util::stream_format(stream, "cfc%d   %s,%s", cop, reg[rt], ccreg[cop][rd]);                 break;
-		case 0x04:  util::stream_format(stream, "mtc%d   %s,%s", cop, reg[rt], cpreg[cop][rd]);                 break;
+		case 0x04:  util::stream_format(stream, "mtc%d   %s,%s", cop, reg[rt], cp_name);                        break;
 		case 0x06:  util::stream_format(stream, "ctc%d   %s,%s", cop, reg[rt], ccreg[cop][rd]);                 break;
 		case 0x08:  /* BC */
 			switch (rt)
@@ -147,6 +158,11 @@ uint32_t mips1_disassembler::dasm_cop(uint32_t pc, int cop, uint32_t op, std::os
 					case 0x06:  util::stream_format(stream, "tlbwr");                                           break;
 					case 0x08:  util::stream_format(stream, "tlbp");                                            break;
 					case 0x10:  util::stream_format(stream, "rfe");                                             break;
+					case 0x1f:  if (m_multiply_to_gpr)
+									{ util::stream_format(stream, "deret"); flags = STEP_OUT; }
+								else
+									util::stream_format(stream, "cop%d  0x%07x", cop, op & 0x01ffffff);
+								break;
 					default:    util::stream_format(stream, "cop%d  0x%07x", cop, op & 0x01ffffff);             break;
 				}
 			}
@@ -275,6 +291,11 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 					break;
 				case 0x0c:  util::stream_format(stream, "syscall"); flags = STEP_OVER;                 break;
 				case 0x0d:  util::stream_format(stream, "break"); flags = STEP_OVER;                   break;
+				case 0x0e:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "sdbbp  0x%x", (op >> 6) & 0xfffff); flags = STEP_OVER; }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
 				case 0x0f:  if (m_multiply_to_gpr && !(op & 0x03ffffc0))
 								util::stream_format(stream, "sync");
 							else
