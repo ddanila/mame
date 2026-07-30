@@ -974,8 +974,13 @@ private:
 	static constexpr u32 DINO_ALARM_LOW = 0x14c / 4;
 	static constexpr u32 DINO_TIMER_CONTROL = 0x150 / 4;
 	static constexpr u32 DINO_PERIODIC_TIMER = 0x154 / 4;
+	static constexpr u32 DINO_TIMER_FREEZE_PRESCALER = 0x0000'0080;
+	static constexpr u32 DINO_TIMER_FREEZE_RTC = 0x0000'0040;
 	static constexpr u32 DINO_TIMER_FREEZE_PERIODIC = 0x0000'0020;
 	static constexpr u32 DINO_TIMER_ENABLE_PERIODIC = 0x0000'0010;
+	static constexpr u32 DINO_TIMER_CLEAR_RTC = 0x0000'0008;
+	static constexpr u32 DINO_TIMER_RTC_TEST_CLOCK = 0x0000'0002;
+	static constexpr u32 DINO_TIMER_RTC_TEST = 0x0000'0001;
 	static constexpr u32 DINO_PERIODIC_LOAD = 0x0000'ffff;
 	static constexpr u32 DINO_IO_CONTROL = 0x180 / 4;
 	static constexpr u32 DINO_MFIO_DATA_OUTPUT = 0x184 / 4;
@@ -1115,6 +1120,7 @@ private:
 	void update_periodic_timer();
 	void start_stop_timer();
 	u64 rtc_ticks() const;
+	void advance_rtc_test(offs_t offset);
 	void persist_rtc();
 	void update_rtc_timers();
 	TIMER_CALLBACK_MEMBER(periodic_tick);
@@ -2794,13 +2800,48 @@ u64 datarover_state::rtc_ticks() const
 {
 	static constexpr u64 RTC_MASK = 0x0000'00ff'ffff'ffff;
 
-	if (BIT(m_dino[DINO_TIMER_CONTROL], 3))
+	u32 const control = m_dino[DINO_TIMER_CONTROL];
+	if (control & DINO_TIMER_CLEAR_RTC)
 		return 0;
 
 	u64 ticks = m_rtc_base;
-	if (!BIT(m_dino[DINO_TIMER_CONTROL], 6))
+	bool const rough_test = (control & DINO_TIMER_RTC_TEST)
+			&& !(control & DINO_TIMER_FREEZE_PRESCALER);
+	bool const fine_test = (control & DINO_TIMER_RTC_TEST_CLOCK)
+			&& !(control & DINO_TIMER_FREEZE_RTC);
+	if (!rough_test && !fine_test && !(control & DINO_TIMER_FREEZE_RTC))
+	{
 		ticks += u64(machine().time().as_ticks(32'768)) - m_rtc_origin;
+	}
 	return ticks & RTC_MASK;
+}
+
+
+void datarover_state::advance_rtc_test(offs_t offset)
+{
+	static constexpr u64 RTC_MASK = 0x0000'00ff'ffff'ffff;
+	u32 const control = m_dino[DINO_TIMER_CONTROL];
+
+	// Dino's test source frequency is undocumented.  Its only ROM-observed
+	// consumers poll the affected register for each next counter value, so
+	// make one test-clock pulse observable at that poll boundary.  This avoids
+	// skipping equality tests at MAME scheduler-slice boundaries.
+	if (offset == DINO_RTC_HIGH
+			&& (control & DINO_TIMER_RTC_TEST)
+			&& !(control & DINO_TIMER_FREEZE_PRESCALER))
+	{
+		m_rtc_base = (m_rtc_base + (u64(1) << 32)) & RTC_MASK;
+	}
+	else if (offset == DINO_RTC_LOW
+			&& (control & DINO_TIMER_RTC_TEST_CLOCK)
+			&& !(control & DINO_TIMER_FREEZE_RTC))
+	{
+		// Fine test mode advances the low stage without carrying into the
+		// separately adjusted rtcHigh stage.
+		m_rtc_base =
+				(m_rtc_base & 0x0000'00ff'0000'0000)
+				| u32(m_rtc_base + 32);
+	}
 }
 
 
@@ -2827,7 +2868,11 @@ void datarover_state::update_rtc_timers()
 
 	m_rtc_alarm_timer->reset();
 	m_rtc_rollover_timer->reset();
-	if (BIT(m_dino[DINO_TIMER_CONTROL], 3) || BIT(m_dino[DINO_TIMER_CONTROL], 6))
+	if (m_dino[DINO_TIMER_CONTROL]
+			& (DINO_TIMER_CLEAR_RTC
+					| DINO_TIMER_FREEZE_RTC
+					| DINO_TIMER_RTC_TEST_CLOCK
+					| DINO_TIMER_RTC_TEST))
 		return;
 
 	u64 const current = rtc_ticks();
@@ -3503,9 +3548,11 @@ u32 datarover_state::dino_r(offs_t offset, u32 mem_mask)
 				| (m_irda_carrier->read() ? INT5_IR_CARRIER_PIN : 0);
 
 	case DINO_RTC_HIGH:
+		advance_rtc_test(offset);
 		return u32(rtc_ticks() >> 32) & 0xff;
 
 	case DINO_RTC_LOW:
+		advance_rtc_test(offset);
 		return u32(rtc_ticks());
 
 	case DINO_PERIODIC_TIMER:
@@ -3712,14 +3759,20 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 			m_periodic_remaining =
 					m_dino[DINO_PERIODIC_TIMER] & DINO_PERIODIC_LOAD;
 		}
-		if (BIT(m_dino[offset], 3))
+		if (m_dino[offset] & DINO_TIMER_CLEAR_RTC)
 		{
 			m_rtc_base = 0;
 			m_rtc_origin = machine().time().as_ticks(32'768);
 		}
-		else if (BIT(old_control, 3) || (BIT(old_control, 6) != BIT(m_dino[offset], 6)))
+		else if ((old_control & DINO_TIMER_CLEAR_RTC)
+				|| ((old_control ^ m_dino[offset])
+						& (DINO_TIMER_FREEZE_PRESCALER
+								| DINO_TIMER_FREEZE_RTC
+								| DINO_TIMER_RTC_TEST_CLOCK
+								| DINO_TIMER_RTC_TEST)))
 		{
-			m_rtc_base = BIT(old_control, 3) ? 0 : current_ticks;
+			m_rtc_base =
+					(old_control & DINO_TIMER_CLEAR_RTC) ? 0 : current_ticks;
 			m_rtc_origin = machine().time().as_ticks(32'768);
 		}
 		update_periodic_timer();
