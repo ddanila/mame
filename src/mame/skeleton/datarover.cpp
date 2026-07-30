@@ -2225,6 +2225,7 @@ void datarover_state::advance_sound_dma()
 		u32 const word = (u32(first) << 16) | second;
 		u32 const base = m_dino[DINO_SIB_SOUND_RX_START] & 0x1fff'fffc;
 		m_maincpu->space(AS_PROGRAM).write_dword(base + ptr * 4, word);
+		m_maincpu->invalidate_data_cache(base + ptr * 4, sizeof(word));
 	}
 
 	if ((m_dino[DINO_SIB_DMA] & SIB_SOUND_TX_DMA_EN)
@@ -2395,6 +2396,7 @@ void datarover_state::advance_telecom_dma()
 			}
 		}
 		space.write_dword(base + ptr * 4, received);
+		m_maincpu->invalidate_data_cache(base + ptr * 4, sizeof(received));
 	}
 
 	++ptr;
@@ -3374,6 +3376,7 @@ void datarover_state::magicbus_deliver_response()
 		unsigned const count = std::min(response_size, requested);
 		for (unsigned offset = 0; offset < count; ++offset)
 			space.write_byte(start + offset, response[offset]);
+		m_maincpu->invalidate_data_cache(start, count);
 
 		m_dino[DINO_MBUS_DMA_COUNT] = count >= 4 ? count - 4 : 0;
 		m_dino[DINO_INTERRUPT2] |= INT2_MBUS_COMMAND | INT2_MBUS_DMA_END;
@@ -3584,7 +3587,7 @@ void datarover_state::dino_w(offs_t offset, u32 data, u32 mem_mask)
 		COMBINE_DATA(&m_dino[offset]);
 		m_dino[offset] = (m_dino[offset] & ~0x8000'0000) | irq;
 		if (BIT(m_dino[offset], 0)
-				&& dino_clock_enabled(DINO_CLOCK_MBUS))
+				&& dino_clock_enabled(DINO_CLOCK_SIB))
 		{
 			m_dino[DINO_INTERRUPT1] |= 0x0000'0180;
 			if (BIT(m_dino[offset], 4))

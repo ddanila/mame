@@ -289,6 +289,9 @@ class r3900_device : public mips1core_device_base
 public:
 	r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
 
+	// Notify the core that an external bus master changed physical memory.
+	void invalidate_data_cache(u32 address, u32 bytes);
+
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
