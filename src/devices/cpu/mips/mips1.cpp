@@ -34,6 +34,7 @@ enum registers : unsigned
 	MIPS1_FCR30,
 	MIPS1_FCR31,
 	MIPS1_NMI,
+	MIPS1_BERR,
 };
 
 enum exception : u32
@@ -322,6 +323,7 @@ void r3900_device::device_start()
 	state_add(MIPS1_COP0 + COP0_Debug, "Debug", m_cop0[COP0_Debug]);
 	state_add(MIPS1_COP0 + COP0_DEPC, "DEPC", m_cop0[COP0_DEPC]);
 	state_add(MIPS1_NMI, "NMI", m_nmi_pending).mask(1);
+	state_add(MIPS1_BERR, "BERR", m_bus_error).mask(1);
 }
 
 void r3900_device::device_reset()
@@ -378,6 +380,7 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_debug_step_suppress));
 	save_item(NAME(m_nmi_line));
 	save_item(NAME(m_nmi_pending));
+	save_item(NAME(m_bus_error));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -1624,6 +1627,23 @@ void mips1core_device_base::generate_nmi_exception()
 	m_pc = 0xbfc0'0000;
 }
 
+bool mips1core_device_base::handle_bus_error(bool const instruction)
+{
+	if (!m_bus_error)
+		return false;
+
+	m_bus_error = false;
+	if (m_multiply_to_gpr
+			&& !instruction
+			&& (m_cop0[COP0_Debug] & DEBUG_DM))
+		m_cop0[COP0_Debug] |= DEBUG_BSF;
+	else
+		generate_exception(
+				instruction ? EXCEPTION_BUSINST : EXCEPTION_BUSDATA);
+
+	return true;
+}
+
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
 	// An exception flushes the integer pipeline.  A TX39 divide continues in
@@ -2021,13 +2041,8 @@ bool mips1core_device_base::cache_refill(u32 address, bool icache)
 		struct cache::line &line =
 				std::get<0>(cache_lookup(refill_address, true, icache));
 		u32 const data = space(AS_PROGRAM).read_dword(refill_address);
-		if (m_bus_error)
-		{
-			m_bus_error = false;
-			generate_exception(
-					icache ? EXCEPTION_BUSINST : EXCEPTION_BUSDATA);
+		if (handle_bus_error(icache))
 			return false;
-		}
 
 		line.update(data);
 		cache_lock(refill_address, icache);
@@ -2091,13 +2106,8 @@ std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> mi
 			else if constexpr (sizeof(T) == 1)
 				data = space(AS_PROGRAM).read_byte(address);
 
-			if (m_bus_error)
-			{
-				m_bus_error = false;
-				generate_exception(EXCEPTION_BUSDATA);
-
+			if (handle_bus_error(false))
 				return;
-			}
 		}
 	}
 	else
@@ -2161,13 +2171,8 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 				{
 					// reload the cache line from memory
 					u32 const data = space(AS_PROGRAM).read_dword(address);
-					if (m_bus_error)
-					{
-						m_bus_error = false;
-						generate_exception(EXCEPTION_BUSDATA);
-
+					if (handle_bus_error(false))
 						return;
-					}
 
 					l.update(data);
 				}
@@ -2191,6 +2196,9 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 				space(AS_PROGRAM).write_word(address, T(data), mem_mask);
 			else if constexpr (sizeof(T) == 1)
 				space(AS_PROGRAM).write_byte(address, T(data));
+
+			if (handle_bus_error(false))
+				return;
 		}
 	}
 	else
@@ -2233,13 +2241,8 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 	{
 		data = space(AS_PROGRAM).read_dword(address);
 
-		if (m_bus_error)
-		{
-			m_bus_error = false;
-			generate_exception(EXCEPTION_BUSINST);
-
+		if (handle_bus_error(true))
 			return;
-		}
 	}
 
 	apply(data);

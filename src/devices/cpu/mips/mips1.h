@@ -41,6 +41,7 @@ protected:
 	void generate_exception(u32 exception, bool refill = false);
 	void generate_nmi_exception();
 	void generate_debug_exception(u32 cause);
+	bool handle_bus_error(bool instruction);
 	void address_error(int intention, u32 const address);
 	virtual void exception_enter();
 
