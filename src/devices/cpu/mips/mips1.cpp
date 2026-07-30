@@ -307,6 +307,7 @@ void r3900_device::device_reset()
 	// all cache auto-lock modes are clear.
 	m_cop0[COP0_Config] = 0x0010'0030;
 	m_cop0[COP0_Cache] = 0;
+	set_clock_scale(1.0);
 }
 
 iop_device::iop_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -939,9 +940,15 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 		// ICS/DCS are read-only implementation sizes.  Reserved bits read
 		// zero, and setting Lock prevents all writes until reset.
 		if (!BIT(m_cop0[COP0_Config], 7))
+		{
 			m_cop0[COP0_Config] =
 					(m_cop0[COP0_Config] & 0x003f'0000)
 					| (data & 0x0000'0fff);
+			// RF selects the processor clock divided by 1, 2, 4, or 8.
+			// External devices retain their independently configured clocks.
+			set_clock_scale(
+					1.0 / double(1U << BIT(m_cop0[COP0_Config], 10, 2)));
+		}
 		break;
 
 	case COP0_Cache:
