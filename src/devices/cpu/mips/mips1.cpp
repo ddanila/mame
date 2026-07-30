@@ -1938,8 +1938,10 @@ std::tuple<struct mips1core_device_base::cache::line &, bool> mips1core_device_b
 	struct cache &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
 	unsigned const index = c.index(address);
 
-	// clear cache parity error
-	SR &= ~SR_PE;
+	// Clear cache parity error on baseline MIPS-I devices.  The R3900
+	// reassigns this Status bit to its write-one-to-clear NmI latch.
+	if (!m_multiply_to_gpr)
+		SR &= ~SR_PE;
 
 	// Compare every way before selecting a replacement.
 	unsigned selected = c.lru[index];
