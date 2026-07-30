@@ -1044,7 +1044,12 @@ void mips1core_device_base::execute_run()
 				swr(op);
 				break;
 			case 0x2f: // CACHE
-				handle_cache(op);
+				// CACHE is a CP0 operation on the R3900.  Kernel mode may
+				// always use CP0, but user mode requires Status.CU0.
+				if (!(SR & SR_KUc) || (SR & SR_COP0))
+					handle_cache(op);
+				else
+					generate_exception(EXCEPTION_BADCOP0);
 				break;
 			case 0x31: // LWC1
 				handle_cop1(op);
