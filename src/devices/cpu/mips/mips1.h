@@ -40,9 +40,11 @@ protected:
 	// exceptions
 	void generate_exception(u32 exception, bool refill = false);
 	void address_error(int intention, u32 const address);
+	virtual void exception_enter();
 
 	// cop0
 	virtual void handle_cop0(u32 const op);
+	virtual void handle_rfe();
 	virtual u32 get_cop0_reg(unsigned const reg);
 	virtual void set_cop0_reg(unsigned const reg, u32 const data);
 
@@ -259,7 +261,13 @@ public:
 	r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
 
 protected:
+	virtual void device_start() override ATTR_COLD;
+	virtual void device_reset() override ATTR_COLD;
 	virtual translate_result translate(int intention, offs_t &address, bool debug) override;
+	virtual void exception_enter() override;
+	virtual void handle_rfe() override;
+	virtual u32 get_cop0_reg(unsigned const reg) override;
+	virtual void set_cop0_reg(unsigned const reg, u32 const data) override;
 	virtual void handle_special2(u32 const op) override;
 	virtual void handle_cache(u32 const op) override;
 };
