@@ -4181,12 +4181,12 @@ void datarover_state::machine_start()
 	// subsequent runs load the independently writable flash NVRAM instead.
 	if (m_flash[0])
 	{
-		u8 const *const source = memregion("maincpu")->base();
 		for (unsigned lane = 0; lane < m_flash.size(); ++lane)
 		{
 			u8 *const target = memregion(m_flash[lane]->tag())->base();
 			for (u32 offset = 0; offset < 0x20'0000; ++offset)
-				target[offset] = source[(offset * 4) + lane];
+				target[offset] =
+						m_rom[offset] >> (24 - (lane * 8));
 		}
 	}
 
@@ -4672,7 +4672,7 @@ ROM_END
 
 
 //    YEAR  NAME           PARENT        COMPAT  MACHINE        INPUT         CLASS             INIT        COMPANY          FULLNAME                       FLAGS
-COMP( 1998, datarover840,  0,            0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840",               MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
-COMP( 1998, datarover840f, datarover840, 0,      datarover840f, datarover840, datarover_state, empty_init, "General Magic", "DataRover 840F (flash)",       MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
-COMP( 1998, datarover840j, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (Japan ROM)",    MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
-COMP( 1998, datarover840d, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (development ROM, 1998-04-07)", MACHINE_NOT_WORKING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840,  0,            0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840",               MACHINE_IMPERFECT_TIMING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840f, datarover840, 0,      datarover840f, datarover840, datarover_state, empty_init, "General Magic", "DataRover 840F (flash)",       MACHINE_IMPERFECT_TIMING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840j, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (Japan ROM)",    MACHINE_IMPERFECT_TIMING | MACHINE_SUPPORTS_SAVE )
+COMP( 1998, datarover840d, datarover840, 0,      datarover840,  datarover840, datarover_state, empty_init, "General Magic", "DataRover 840 (development ROM, 1998-04-07)", MACHINE_IMPERFECT_TIMING | MACHINE_SUPPORTS_SAVE )
