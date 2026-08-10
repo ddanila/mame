@@ -54,10 +54,7 @@
 #include <vector>
 
 
-class datarover_uart_device;
-DECLARE_DEVICE_TYPE(DATAROVER_UART, datarover_uart_device)
-class datarover_irda_device;
-DECLARE_DEVICE_TYPE(DATAROVER_IRDA, datarover_irda_device)
+namespace {
 
 class datarover_uart_device :
 	public device_t,
@@ -111,8 +108,9 @@ private:
 	devcb_write8 m_received_handler;
 };
 
-DEFINE_DEVICE_TYPE(
+DEFINE_DEVICE_TYPE_PRIVATE(
 		DATAROVER_UART,
+		datarover_uart_device,
 		datarover_uart_device,
 		"datarover_uart",
 		"DataRover Dino UART")
@@ -190,8 +188,9 @@ private:
 	emu_timer *m_poll_timer = nullptr;
 };
 
-DEFINE_DEVICE_TYPE(
+DEFINE_DEVICE_TYPE_PRIVATE(
 		DATAROVER_IRDA,
+		datarover_irda_device,
 		datarover_irda_device,
 		"datarover_irda",
 		"DataRover IrDA SIR Port")
@@ -234,9 +233,6 @@ TIMER_CALLBACK_MEMBER(datarover_irda_device::poll)
 	}
 }
 
-
-class datarover_modem_pccard_device;
-DECLARE_DEVICE_TYPE(DATAROVER_MODEM_PCCARD, datarover_modem_pccard_device)
 
 class datarover_modem_pccard_device :
 	public device_t,
@@ -286,8 +282,9 @@ private:
 	bool m_tx_irq_pending = false;
 };
 
-DEFINE_DEVICE_TYPE(
+DEFINE_DEVICE_TYPE_PRIVATE(
 		DATAROVER_MODEM_PCCARD,
+		datarover_modem_pccard_device,
 		datarover_modem_pccard_device,
 		"datarover_modem_pccard",
 		"DataRover PC Card Hayes Modem")
@@ -569,9 +566,6 @@ void datarover_modem_pccard_device::write_reg(
 }
 
 
-class datarover_linear_pccard_device;
-DECLARE_DEVICE_TYPE(DATAROVER_LINEAR_PCCARD, datarover_linear_pccard_device)
-
 class datarover_linear_pccard_device :
 	public device_t,
 	public device_image_interface,
@@ -620,8 +614,9 @@ private:
 	bool m_legacy_storage = false;
 };
 
-DEFINE_DEVICE_TYPE(
+DEFINE_DEVICE_TYPE_PRIVATE(
 		DATAROVER_LINEAR_PCCARD,
+		datarover_linear_pccard_device,
 		datarover_linear_pccard_device,
 		"datarover_linear_pccard",
 		"DataRover 8 MiB Linear Memory PC Card")
@@ -815,9 +810,6 @@ u16 datarover_linear_pccard_device::read_reg(offs_t offset, u16 mem_mask)
 			: ((offset < GENERIC_CIS.size()) ? GENERIC_CIS[offset] : 0xff);
 	return (mem_mask & 0x00ff) ? (0xff00 | value) : 0xffff;
 }
-
-
-namespace {
 
 class datarover_state : public driver_device, public device_sound_interface
 {
