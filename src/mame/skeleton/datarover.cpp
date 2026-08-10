@@ -4821,7 +4821,7 @@ void datarover_state::datarover840(machine_config &config)
 	m_pccard[1]->bvd2().set(FUNC(datarover_state::pccard_bvd2_w<1>));
 	m_pccard[1]->wp().set(FUNC(datarover_state::pccard_wp_w<1>));
 
-	SCREEN(config, m_screen, SCREEN_TYPE_LCD);
+	SCREEN(config, m_screen).set_lcd();
 	m_screen->set_refresh_hz(60);
 	m_screen->set_size(480, 320);
 	m_screen->set_visarea_full();
