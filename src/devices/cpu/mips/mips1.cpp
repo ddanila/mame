@@ -1847,7 +1847,7 @@ void mips1core_device_base::handle_cop1(u32 const op)
 {
 	if (!(SR & SR_COP1))
 		generate_exception(EXCEPTION_BADCOP1);
-	else if (RSREG == 0x08) // BC1
+	else if ((op >> 26) == 0x11 && RSREG == 0x08) // BC1
 		handle_cop_branch(1, op);
 	else
 		generate_exception(EXCEPTION_INVALIDOP);

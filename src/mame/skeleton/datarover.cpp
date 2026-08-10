@@ -49,9 +49,12 @@
 #include "datarover840.lh"
 
 #include <array>
-#include <chrono>
-#include <thread>
 #include <vector>
+
+#define LOG_UART (1U << 1)
+
+#define VERBOSE (0)
+#include "logmacro.h"
 
 
 namespace {
@@ -1667,7 +1670,7 @@ bool datarover_state::uart_dma_receive(unsigned channel, u8 data)
 		m_dino[count_index] = count + 1;
 	}
 
-	logerror(
+	LOGMASKED(LOG_UART,
 			"UART%c DMA RX[%u/%u]: %02x\n",
 			'A' + channel,
 			count,
@@ -1693,7 +1696,7 @@ void datarover_state::uart_transmit(unsigned channel, u8 data, bool dma)
 
 	if (!dma)
 		m_dino[DINO_INTERRUPT2] |= channel ? 0x0001'0000 : 0x0400'0000;
-	logerror(
+	LOGMASKED(LOG_UART,
 			"UART%c%s%s TX: %02x %c\n",
 			'A' + channel,
 			pulsed ? " IrDA" : "",
@@ -2821,39 +2824,27 @@ void datarover_state::telephone_bridge_transmit(u32 samples)
 u32 datarover_state::telephone_bridge_receive()
 {
 	// Pull more than one word so a process that briefly falls behind can
-	// refill its queue instead of preserving a permanent stream offset.
+	// refill its queue instead of preserving a permanent stream offset.  Do
+	// one nonblocking read per emulated telecom tick; underruns below return
+	// to prebuffering without waiting on host time.
 	std::array<u8, 1'024> input;
-	auto const deadline =
-			std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
-	do
+	// Keep socket reads large enough to bypass core_file read-ahead. The
+	// bitbanger's input and output share a file cursor, so interleaved output
+	// would otherwise skip bytes retained in the read buffer.
+	unsigned const count = m_phone_bridge->input(input.data(), input.size());
+	for (unsigned index = 0; index < count; ++index)
 	{
-		// Keep socket reads large enough to bypass core_file read-ahead. The
-		// bitbanger's input and output share a file cursor, so interleaved
-		// output would otherwise skip bytes retained in the read buffer.
-		unsigned const count =
-				m_phone_bridge->input(input.data(), input.size());
-		for (unsigned index = 0; index < count; ++index)
-		{
-			if (m_telephone_bridge_rx_count == m_telephone_bridge_rx.size())
-				break;
-			m_telephone_bridge_rx[
-					(m_telephone_bridge_rx_head
-							+ m_telephone_bridge_rx_count)
-					% m_telephone_bridge_rx.size()] = input[index];
-			++m_telephone_bridge_rx_count;
-		}
-
-		if (!m_telephone_bridge_rx_started
-				|| m_telephone_bridge_rx_count >= 4
-				|| std::chrono::steady_clock::now() >= deadline)
+		if (m_telephone_bridge_rx_count == m_telephone_bridge_rx.size())
 			break;
-		std::this_thread::sleep_for(std::chrono::microseconds(100));
-	} while (true);
+		m_telephone_bridge_rx[
+				(m_telephone_bridge_rx_head + m_telephone_bridge_rx_count)
+				% m_telephone_bridge_rx.size()] = input[index];
+		++m_telephone_bridge_rx_count;
+	}
 
-	// Keep a small startup cushion, then wait briefly for each word so
-	// independent host schedulers cannot make one virtual modem outrun the
-	// other and consume silence. Repeated timeouts return to nonblocking
-	// prebuffering, keeping a disconnected bridge from hanging the machine.
+	// Keep a small startup cushion. Repeated emulated-tick underruns return
+	// to prebuffering, keeping independent host schedulers from leaving the
+	// stream permanently offset.
 	if (!m_telephone_bridge_rx_started)
 	{
 		if (m_telephone_bridge_rx_count < TELEPHONE_BRIDGE_PREBUFFER)
