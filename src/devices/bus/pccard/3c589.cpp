@@ -69,6 +69,8 @@ void etherlink_iii_pccard_device::device_start()
 	save_item(NAME(m_transmit_length));
 	save_item(NAME(m_transmit_header_words));
 	save_item(NAME(m_receive_position));
+	save_item(NAME(m_transmit_status));
+	save_item(NAME(m_transmit_interrupt));
 	save_item(NAME(m_receiver_enabled));
 	save_item(NAME(m_transmitter_enabled));
 	save_item(NAME(m_statistics_enabled));
@@ -108,6 +110,8 @@ void etherlink_iii_pccard_device::device_reset()
 	m_transmit_length = 0;
 	m_transmit_header_words = 0;
 	m_receive_position = 0;
+	m_transmit_status = 0;
+	m_transmit_interrupt = false;
 	m_receiver_enabled = false;
 	m_transmitter_enabled = false;
 	m_statistics_enabled = false;
@@ -128,17 +132,17 @@ void etherlink_iii_pccard_device::set_present(bool present)
 
 void etherlink_iii_pccard_device::update_irq()
 {
-	bool const asserted = bool(m_pending & m_interrupt_enable);
-	if (asserted)
+	static constexpr u16 INTERRUPT_SOURCES =
+			ADAPTER_FAILURE | TX_COMPLETE | TX_AVAILABLE | RX_COMPLETE
+			| RX_EARLY | INT_REQUESTED | STATS_FULL;
+	if (m_pending & m_interrupt_enable & m_status_enable & INTERRUPT_SOURCES)
 	{
-		m_pending |= INT_LATCH | INT_REQUESTED;
-		m_configuration_status |= 0x02;
+		m_pending |= INT_LATCH;
 	}
-	else
-	{
-		m_pending &= ~(INT_LATCH | INT_REQUESTED);
-		m_configuration_status &= ~0x02;
-	}
+
+	bool const asserted = bool(m_pending & INT_LATCH);
+	m_configuration_status = (m_configuration_status & ~0x02)
+			| (asserted ? 0x02 : 0x00);
 
 	// In PC Card I/O mode BVD1 is the active-low IREQ signal.
 	m_bvd1_cb(asserted ? 0 : 1);
@@ -179,13 +183,18 @@ void etherlink_iii_pccard_device::execute_command(u16 command)
 		m_transmit_data.clear();
 		m_transmit_length = 0;
 		m_transmit_header_words = 0;
+		m_transmit_status = 0;
+		m_transmit_interrupt = false;
 		m_pending &= ~(TX_COMPLETE | TX_AVAILABLE);
 		break;
 	case 12: // FakeIntr
-		m_pending |= INT_LATCH;
+		m_pending |= INT_REQUESTED;
 		break;
 	case 13: // AckIntr
-		m_pending &= ~parameter;
+		m_pending &= ~(parameter & (INT_LATCH | TX_AVAILABLE
+				| RX_EARLY | INT_REQUESTED));
+		if (parameter & TX_AVAILABLE)
+			m_transmit_threshold = 0x07ff;
 		break;
 	case 14: // SetIntrEnb
 		m_interrupt_enable = parameter;
@@ -200,8 +209,9 @@ void etherlink_iii_pccard_device::execute_command(u16 command)
 		m_receive_threshold = parameter;
 		break;
 	case 18: // SetTxThreshold
-		m_transmit_threshold = parameter;
-		if (FIFO_BYTES >= parameter)
+		m_transmit_threshold = parameter & ~u16(3);
+		if ((m_transmit_threshold <= 1792)
+				&& (FIFO_BYTES > m_transmit_threshold))
 			m_pending |= TX_AVAILABLE;
 		break;
 	case 19: // SetTxStart
@@ -254,7 +264,7 @@ u16 etherlink_iii_pccard_device::register_r(u8 offset)
 					? 0x8000
 					: u16(m_receive_data.size() & 0x07ff);
 		case 0x0a:
-			return 0x0000; // timer and empty TX-status stack
+			return u16(m_transmit_status) << 8; // timer is low byte
 		case 0x0c:
 			return FIFO_BYTES;
 		}
@@ -331,6 +341,12 @@ void etherlink_iii_pccard_device::register_w(u8 offset, u16 data, u16 mem_mask)
 	case 1:
 		if (offset <= 0x02)
 			fifo_w(data, mem_mask);
+		else if ((offset == 0x0a) && (mem_mask & 0xff00))
+		{
+			m_transmit_status = 0;
+			m_pending &= ~TX_COMPLETE;
+			update_irq();
+		}
 		break;
 
 	case 2:
@@ -375,12 +391,14 @@ void etherlink_iii_pccard_device::fifo_w(u16 data, u16 mem_mask)
 		if (!m_transmit_header_words)
 		{
 			m_transmit_length = value;
+			m_transmit_interrupt = false;
 			m_transmit_header_words = 1;
 			return;
 		}
 		if (m_transmit_header_words == 1)
 		{
-			m_transmit_length |= u16(value) << 8;
+			m_transmit_interrupt = BIT(value, 7);
+			m_transmit_length = (m_transmit_length | (u16(value) << 8)) & 0x07ff;
 			m_transmit_header_words = 2;
 			return;
 		}
@@ -403,14 +421,21 @@ void etherlink_iii_pccard_device::fifo_w(u16 data, u16 mem_mask)
 
 void etherlink_iii_pccard_device::finish_transmit()
 {
-	if (m_transmitter_enabled && m_transmit_length
-			&& (m_transmit_length <= m_transmit_data.size()))
+	bool const transmitted = m_transmitter_enabled && m_transmit_length
+			&& (m_transmit_length <= m_transmit_data.size());
+	if (transmitted)
 		send(m_transmit_data.data(), m_transmit_length);
 
 	m_transmit_data.clear();
 	m_transmit_length = 0;
 	m_transmit_header_words = 0;
-	m_pending |= TX_COMPLETE;
+	if (transmitted && m_transmit_interrupt)
+	{
+		// Complete plus "interrupt requested" in the TX status stack.
+		m_transmit_status = 0xc0;
+		m_pending |= TX_COMPLETE;
+	}
+	m_transmit_interrupt = false;
 	update_irq();
 }
 
