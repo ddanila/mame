@@ -1,10 +1,10 @@
 // license:BSD-3-Clause
 // copyright-holders:Danila Sukharev
 
-#include "catch.hpp"
-
 #include "emu.h"
 #include "cpu/mips/mips1dsm.h"
+
+#include "catch.hpp"
 
 #include <sstream>
 
