@@ -97,18 +97,39 @@ uint32_t mips1_disassembler::dasm_cop(uint32_t pc, int cop, uint32_t op, std::os
 	int rt = (op >> 16) & 31;
 	int rd = (op >> 11) & 31;
 	uint32_t flags = 0;
+	char const *cp_name = cpreg[cop][rd];
+	if (m_multiply_to_gpr && cop == 0)
+	{
+		switch (rd)
+		{
+		case 3:  cp_name = "Config"; break;
+		case 7:  cp_name = "Cache";  break;
+		case 16: cp_name = "Debug";  break;
+		case 17: cp_name = "DEPC";   break;
+		}
+	}
 
 	switch ((op >> 21) & 31)
 	{
-		case 0x00:  util::stream_format(stream, "mfc%d   %s,%s", cop, reg[rt], cpreg[cop][rd]);                 break;
+		case 0x00:  util::stream_format(stream, "mfc%d   %s,%s", cop, reg[rt], cp_name);                        break;
 		case 0x02:  util::stream_format(stream, "cfc%d   %s,%s", cop, reg[rt], ccreg[cop][rd]);                 break;
-		case 0x04:  util::stream_format(stream, "mtc%d   %s,%s", cop, reg[rt], cpreg[cop][rd]);                 break;
+		case 0x04:  util::stream_format(stream, "mtc%d   %s,%s", cop, reg[rt], cp_name);                        break;
 		case 0x06:  util::stream_format(stream, "ctc%d   %s,%s", cop, reg[rt], ccreg[cop][rd]);                 break;
 		case 0x08:  /* BC */
 			switch (rt)
 			{
 				case 0x00:  util::stream_format(stream, "bc%df   0x%08x", cop, pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); break;
 				case 0x01:  util::stream_format(stream, "bc%dt   0x%08x", cop, pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); break;
+				case 0x02:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bc%dfl  0x%08x", cop, pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				case 0x03:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bc%dtl  0x%08x", cop, pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
 				default:    util::stream_format(stream, ".word  0x%08x /*invalid*/", op);                       break;
 			}
 			break;
@@ -137,6 +158,11 @@ uint32_t mips1_disassembler::dasm_cop(uint32_t pc, int cop, uint32_t op, std::os
 					case 0x06:  util::stream_format(stream, "tlbwr");                                           break;
 					case 0x08:  util::stream_format(stream, "tlbp");                                            break;
 					case 0x10:  util::stream_format(stream, "rfe");                                             break;
+					case 0x1f:  if (m_multiply_to_gpr)
+									{ util::stream_format(stream, "deret"); flags = STEP_OUT | step_over_extra(1); }
+								else
+									util::stream_format(stream, "cop%d  0x%07x", cop, op & 0x01ffffff);
+								break;
 					default:    util::stream_format(stream, "cop%d  0x%07x", cop, op & 0x01ffffff);             break;
 				}
 			}
@@ -173,12 +199,21 @@ uint32_t mips1_disassembler::dasm_cop1(uint32_t pc, uint32_t op, std::ostream &s
 		case 0x05:  util::stream_format(stream, "dmtc1  %s,%s", reg[rt], cpreg[1][rd]);                     break;
 		case 0x06:  util::stream_format(stream, "ctc1   %s,%s", reg[rt], ccreg[1][rd]);                     break;
 		case 0x08:  /* BC */
-			switch (rt & 3)
+			switch (rt)
 			{
 				case 0x00:  util::stream_format(stream, "bc1f   0x%08x,%d", pc + 4 + ((int16_t)op << 2), (op >> 18) & 7); flags = STEP_COND | step_over_extra(1); break;
 				case 0x01:  util::stream_format(stream, "bc1t   0x%08x,%d", pc + 4 + ((int16_t)op << 2), (op >> 18) & 7); flags = STEP_COND | step_over_extra(1); break;
-				case 0x02:  util::stream_format(stream, "bc1fl  0x%08x,%d", pc + 4 + ((int16_t)op << 2), (op >> 18) & 7); flags = STEP_COND | step_over_extra(1); break;
-				case 0x03:  util::stream_format(stream, "bc1tl  0x%08x,%d", pc + 4 + ((int16_t)op << 2), (op >> 18) & 7); flags = STEP_COND | step_over_extra(1); break;
+				case 0x02:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bc1fl  0x%08x", pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				case 0x03:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bc1tl  0x%08x", pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				default:    util::stream_format(stream, ".word  0x%08x /*invalid*/", op);                   break;
 			}
 			break;
 		default:    /* COP */
@@ -265,12 +300,30 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 					break;
 				case 0x0c:  util::stream_format(stream, "syscall"); flags = STEP_OVER;                 break;
 				case 0x0d:  util::stream_format(stream, "break"); flags = STEP_OVER;                   break;
+				case 0x0e:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "sdbbp  0x%x", (op >> 6) & 0xfffff); flags = STEP_OVER; }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				case 0x0f:  if (m_multiply_to_gpr && !(op & 0x03ffffc0))
+								util::stream_format(stream, "sync");
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
 				case 0x10:  util::stream_format(stream, "mfhi   %s", reg[rd]);                                  break;
 				case 0x11:  util::stream_format(stream, "mthi   %s", reg[rs]);                                  break;
 				case 0x12:  util::stream_format(stream, "mflo   %s", reg[rd]);                                  break;
 				case 0x13:  util::stream_format(stream, "mtlo   %s", reg[rs]);                                  break;
-				case 0x18:  util::stream_format(stream, "mult   %s,%s", reg[rs], reg[rt]);                      break;
-				case 0x19:  util::stream_format(stream, "multu  %s,%s", reg[rs], reg[rt]);                      break;
+				case 0x18:  if (m_multiply_to_gpr && rd)
+								util::stream_format(stream, "mult   %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+							else
+								util::stream_format(stream, "mult   %s,%s", reg[rs], reg[rt]);
+							break;
+				case 0x19:  if (m_multiply_to_gpr && rd)
+								util::stream_format(stream, "multu  %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+							else
+								util::stream_format(stream, "multu  %s,%s", reg[rs], reg[rt]);
+							break;
 				case 0x1a:  util::stream_format(stream, "div    %s,%s", reg[rs], reg[rt]);                      break;
 				case 0x1b:  util::stream_format(stream, "divu   %s,%s", reg[rs], reg[rt]);                      break;
 				case 0x20:  util::stream_format(stream, "add    %s,%s,%s", reg[rd], reg[rs], reg[rt]);          break;
@@ -312,12 +365,32 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 			{
 				case 0x00:  util::stream_format(stream, "bltz   %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); if (rs != 0) flags = STEP_COND | step_over_extra(1); break;
 				case 0x01:  util::stream_format(stream, "bgez   %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); if (rs != 0) flags = STEP_COND | step_over_extra(1); break;
+				case 0x02:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bltzl  %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				case 0x03:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bgezl  %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
 				case 0x10:  util::stream_format(stream, "bltzal %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); if (rs != 0) flags = STEP_OVER | STEP_COND | step_over_extra(1); break;
 				case 0x11:  if (rs == 0)
 							util::stream_format(stream, "bal    0x%08x", pc + 4 + ((int16_t)op << 2));
 							else
 							util::stream_format(stream, "bgezal %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2));
 							flags = STEP_OVER | (rs != 0 ? STEP_COND : 0) | step_over_extra(1);
+							break;
+				case 0x12:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bltzall %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_OVER | STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+							break;
+				case 0x13:  if (m_multiply_to_gpr)
+								{ util::stream_format(stream, "bgezall %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_OVER | STEP_COND | step_over_extra(1); }
+							else
+								util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
 							break;
 				default:    util::stream_format(stream, ".word  0x%08x /*invalid*/", op);                       break;
 			}
@@ -344,6 +417,26 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 					break;
 		case 0x06:  util::stream_format(stream, "blez   %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); break;
 		case 0x07:  util::stream_format(stream, "bgtz   %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); break;
+		case 0x14:  if (m_multiply_to_gpr)
+						{ util::stream_format(stream, "beql   %s,%s,0x%08x", reg[rs], reg[rt], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+					else
+						util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+					break;
+		case 0x15:  if (m_multiply_to_gpr)
+						{ util::stream_format(stream, "bnel   %s,%s,0x%08x", reg[rs], reg[rt], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+					else
+						util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+					break;
+		case 0x16:  if (m_multiply_to_gpr)
+						{ util::stream_format(stream, "blezl  %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+					else
+						util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+					break;
+		case 0x17:  if (m_multiply_to_gpr)
+						{ util::stream_format(stream, "bgtzl  %s,0x%08x", reg[rs], pc + 4 + ((int16_t)op << 2)); flags = STEP_COND | step_over_extra(1); }
+					else
+						util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+					break;
 		case 0x08:  util::stream_format(stream, "addi   %s,%s,%s", reg[rt], reg[rs], signed_16bit(op));         break;
 		case 0x09:  if (rs == 0)
 					util::stream_format(stream, "li     %s,%s", reg[rt], signed_16bit(op));
@@ -364,6 +457,29 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 		case 0x11:  flags = dasm_cop1(pc, op, stream);                                          break;
 		case 0x12:  flags = dasm_cop(pc, 2, op, stream);                                            break;
 		case 0x13:  flags = dasm_cop(pc, 3, op, stream);                                            break;
+		case 0x1c:
+			if (!m_multiply_to_gpr || shift)
+			{
+				util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+			}
+			else
+			{
+				switch (op & 63)
+				{
+					case 0x00:  if (rd == 0)
+								util::stream_format(stream, "madd   %s,%s", reg[rs], reg[rt]);
+								else
+								util::stream_format(stream, "madd   %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+						break;
+					case 0x01:  if (rd == 0)
+								util::stream_format(stream, "maddu  %s,%s", reg[rs], reg[rt]);
+								else
+								util::stream_format(stream, "maddu  %s,%s,%s", reg[rd], reg[rs], reg[rt]);
+						break;
+					default:    util::stream_format(stream, ".word  0x%08x /*invalid*/", op);                       break;
+				}
+			}
+			break;
 		case 0x20:  util::stream_format(stream, "lb     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x21:  util::stream_format(stream, "lh     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x22:  util::stream_format(stream, "lwl    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
@@ -376,6 +492,11 @@ offs_t mips1_disassembler::disassemble(std::ostream &stream, offs_t pc, const da
 		case 0x2a:  util::stream_format(stream, "swl    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x2b:  util::stream_format(stream, "sw     %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
 		case 0x2e:  util::stream_format(stream, "swr    %s,%s(%s)", reg[rt], signed_16bit(op), reg[rs]);        break;
+		case 0x2f:  if (m_multiply_to_gpr)
+						util::stream_format(stream, "cache  0x%x,%s(%s)", rt, signed_16bit(op), reg[rs]);
+					else
+						util::stream_format(stream, ".word  0x%08x /*invalid*/", op);
+					break;
 		case 0x31:  util::stream_format(stream, "lwc1   %s,%s(%s)", cpreg[1][rt], signed_16bit(op), reg[rs]);   break;
 		case 0x32:  util::stream_format(stream, "lwc2   %s,%s(%s)", cpreg[2][rt], signed_16bit(op), reg[rs]);   break;
 		case 0x33:  util::stream_format(stream, "lwc3   %s,%s(%s)", cpreg[3][rt], signed_16bit(op), reg[rs]);   break;
