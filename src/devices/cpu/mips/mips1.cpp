@@ -245,6 +245,7 @@ mips1core_device_base::mips1core_device_base(machine_config const &mconfig, devi
 	, m_divide_cycles(0)
 	, m_gpr_delay(0)
 	, m_debug_step_suppress(false)
+	, m_deret_pending(false)
 	, m_nmi_line(false)
 	, m_nmi_pending(false)
 	, m_icount(0)
@@ -382,6 +383,7 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_divide_cycles));
 	save_item(NAME(m_gpr_delay));
 	save_item(NAME(m_debug_step_suppress));
+	save_item(NAME(m_deret_pending));
 	save_item(NAME(m_nmi_line));
 	save_item(NAME(m_nmi_pending));
 	save_item(NAME(m_bus_error));
@@ -417,6 +419,7 @@ void mips1core_device_base::state_import(device_state_entry const &entry)
 		m_branch_state = NONE;
 		m_branch_target = 0;
 		m_debug_step_suppress = false;
+		m_deret_pending = false;
 	}
 }
 
@@ -444,6 +447,7 @@ void mips1core_device_base::device_reset()
 	m_divide_cycles = 0;
 	m_gpr_delay = 0;
 	m_debug_step_suppress = false;
+	m_deret_pending = false;
 	m_nmi_line = false;
 	m_nmi_pending = false;
 	m_icache.reset();
@@ -481,6 +485,8 @@ void mips1core_device_base::execute_run()
 		int const cycle_start = m_icount;
 		bool divide_started = false;
 		bool const debug_step_suppressed = m_debug_step_suppress;
+		bool const deret_delay =
+				m_deret_pending && (m_branch_state == DELAY);
 
 		// debugging
 		debugger_instruction_hook(m_pc);
@@ -498,12 +504,13 @@ void mips1core_device_base::execute_run()
 
 		if (debug_step)
 		{
-			// The TX39 records an asynchronous exception coincident with a
-			// debug single step in the ordinary exception registers, then
+			// The TX39 records an exception coincident with a debug single
+			// step in the ordinary exception registers, then
 			// enters debug mode with DEPC still naming the stepped boundary.
 			u32 const debug_pc = m_pc;
 			branch_state const debug_branch_state = m_branch_state;
 			u32 coincident = 0;
+			bool enter_debug = true;
 			if (nmi)
 			{
 				generate_nmi_exception();
@@ -520,21 +527,42 @@ void mips1core_device_base::execute_run()
 				generate_exception(EXCEPTION_INTERRUPT);
 				coincident = DEBUG_OES;
 			}
+			else
+			{
+				// A single-step debug exception is taken after the instruction
+				// fetch.  Preserve a coincident fetch exception (notably AdEL
+				// for a misaligned branch target) in the ordinary exception
+				// registers before entering debug mode.
+				fetch(debug_pc, [](u32) { });
+				if (m_branch_state == EXCEPTION)
+				{
+					if ((CAUSE & CAUSE_EXCCODE) == EXCEPTION_ADDRLOAD)
+						coincident = DEBUG_OES;
+					else
+						enter_debug = false;
+				}
+			}
 
-			if (coincident)
+			if (enter_debug && coincident)
 			{
 				m_pc = debug_pc;
 				m_branch_state = debug_branch_state;
 			}
-			generate_debug_exception(DEBUG_DSS | coincident);
+			if (enter_debug)
+				generate_debug_exception(DEBUG_DSS | coincident);
 		}
 		else if (nmi)
 			generate_nmi_exception();
 		else
 		{
 			// fetch instruction
-			fetch(m_pc, [this, &divide_started](u32 const op)
+			u32 const fetch_pc = m_pc;
+			branch_state const fetch_branch_state = m_branch_state;
+			bool instruction_fetched = false;
+			fetch(m_pc, [this, &divide_started, &instruction_fetched](u32 const op)
 			{
+			instruction_fetched = true;
+
 			// check for interrupts
 			if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
 			{
@@ -1090,9 +1118,28 @@ void mips1core_device_base::execute_run()
 			// clear register 0
 			m_r[0] = 0;
 			});
+
+			// DERET suppresses an ordinary single step at its return
+			// destination, but a destination that cannot be fetched has no
+			// instruction to suppress.  Preserve the permitted DSS+AdEL
+			// coincidence in that case as well.
+			if (m_multiply_to_gpr
+					&& debug_step_suppressed
+					&& (m_cop0[COP0_Debug] & DEBUG_SST)
+					&& !(m_cop0[COP0_Debug] & DEBUG_DM)
+					&& !instruction_fetched
+					&& (m_branch_state == EXCEPTION)
+					&& ((CAUSE & CAUSE_EXCCODE) == EXCEPTION_ADDRLOAD))
+			{
+				m_pc = fetch_pc;
+				m_branch_state = fetch_branch_state;
+				generate_debug_exception(DEBUG_DSS | DEBUG_OES);
+			}
 		}
 
 		// update pc and branch state
+		bool const complete_deret =
+				deret_delay && (m_branch_state == DELAY);
 		switch (m_branch_state)
 		{
 		case NONE:
@@ -1123,6 +1170,19 @@ void mips1core_device_base::execute_run()
 		// that instruction branches, through its delay slot as well.
 		if (debug_step_suppressed)
 			m_debug_step_suppress = m_branch_state == DELAY;
+
+		// DERET's mode changes occur with its delayed transfer, after the
+		// instruction in the debug handler's delay slot has executed.
+		if (complete_deret)
+		{
+			m_deret_pending = false;
+			m_cop0[COP0_Debug] &= ~DEBUG_DM;
+			bool const was_user = bool(SR & SR_KUc);
+			SR |= SR_KUc | SR_IEc;
+			if (!was_user)
+				debugger_privilege_hook();
+			m_debug_step_suppress = true;
+		}
 
 		// The R3900 divider runs beside the integer pipeline.  Account for
 		// every elapsed core cycle, including another pipeline interlock, but
@@ -1213,13 +1273,15 @@ mips1core_device_base::translate_result mips1core_device_base::translate(int int
 
 mips1core_device_base::translate_result r3900_device::translate(int intention, offs_t &address, bool debug)
 {
-	// The R3900 has no TLB.  Unlike the IDT-derived embedded cores above,
-	// its kuseg addresses map directly to the corresponding physical address.
-	translate_result result;
-	if (!BIT(address, 31))
-		result = m_cache;
-	else
-		result = mips1core_device_base::translate(intention, address, debug);
+	// The R3900 has no TLB.  Kuseg is offset by 1 GiB, kseg0/kseg1 map
+	// through physical segment zero, and kseg2 is direct-mapped.  The top
+	// 16 MiB of kuseg and kseg2 are uncached windows.
+	offs_t const virtual_address = address;
+	translate_result result =
+			mips1core_device_base::translate(intention, address, debug);
+	if (result == CACHED
+			&& (virtual_address & 0x7f00'0000) == 0x7f00'0000)
+		result = UNCACHED;
 
 	// Disabled caches behave like uncached accesses: every access misses and
 	// no refill takes place.  Instruction and data enables are independent.
@@ -1296,10 +1358,14 @@ void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
 		break;
 
 	case COP0_Status:
-		// NmI is a write-one-to-clear status latch on the R3900.
+		// Bits 19:16 and the other inherited R3000 cache controls are
+		// reserved.  TS is read-only one because the R3900 has no TLB, while
+		// NmI is a write-one-to-clear status latch.
 		mips1core_device_base::set_cop0_reg(
 				reg,
-				(data & ~SR_NMI)
+				(data & (SR_COP3 | SR_COP2 | SR_COP1 | SR_COP0
+						| SR_RE | SR_BEV | SR_IM | SR_KUIE))
+						| SR_TS
 						| ((data & SR_NMI) ? 0 : (SR & SR_NMI)));
 		break;
 
@@ -1538,6 +1604,7 @@ void r3900_device::handle_cache(u32 const op)
 		if (!BIT(m_cop0[COP0_Config], 5))
 		{
 			// One instruction-cache tag covers four words.
+			address &= ~0x0f;
 			for (unsigned word = 0; word < 4; ++word)
 				std::get<0>(
 						cache_lookup(address + word * 4, false, true))
@@ -1636,6 +1703,7 @@ void mips1core_device_base::generate_debug_exception(u32 const cause)
 	// Debug exceptions use their own state and vector.  Ordinary Status,
 	// Cause and EPC state is deliberately left untouched.
 	m_gpr_delay = 0;
+	m_deret_pending = false;
 	m_cop0[COP0_DEPC] = m_pc;
 
 	u32 debug = m_cop0[COP0_Debug] & (DEBUG_BSF | DEBUG_SST);
@@ -1657,6 +1725,7 @@ void mips1core_device_base::generate_nmi_exception()
 	// fixed uncached reset/NMI vector.
 	m_nmi_pending = false;
 	m_gpr_delay = 0;
+	m_deret_pending = false;
 	m_cop0[COP0_EPC] = m_pc;
 	CAUSE &= ~CAUSE_BD;
 	if (m_branch_state == DELAY)
@@ -1693,6 +1762,7 @@ void mips1core_device_base::generate_exception(u32 exception, bool refill)
 	// its independent unit, but a one-cycle GPR dependency does not carry into
 	// the exception handler.
 	m_gpr_delay = 0;
+	m_deret_pending = false;
 
 	// set the exception PC
 	m_cop0[COP0_EPC] = m_pc;
@@ -1776,14 +1846,9 @@ void mips1core_device_base::handle_cop0(u32 const op)
 			case 0x1f: // R3900 DERET
 				if (m_multiply_to_gpr && (m_cop0[COP0_Debug] & DEBUG_DM))
 				{
-					m_pc = m_cop0[COP0_DEPC];
-					m_branch_state = EXCEPTION;
-					m_cop0[COP0_Debug] &= ~DEBUG_DM;
-					bool const was_user = bool(SR & SR_KUc);
-					SR |= SR_KUc | SR_IEc;
-					if (!was_user)
-						debugger_privilege_hook();
-					m_debug_step_suppress = true;
+					m_branch_target = m_cop0[COP0_DEPC];
+					m_branch_state = BRANCH;
+					m_deret_pending = true;
 				}
 				else
 					generate_exception(EXCEPTION_INVALIDOP);
@@ -2072,12 +2137,19 @@ void mips1core_device_base::cache_lock(u32 address, bool icache)
 	unsigned const index = c.index(address);
 	for (unsigned way = 0; way < c.ways; ++way)
 	{
+		if (c.at(index, way).locked)
+		{
+			c.lru[index] = way ^ 1;
+			return;
+		}
+	}
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
 		struct cache::line &candidate = c.at(index, way);
 		if (!((candidate.tag ^ address)
 					& (-c.way_size() | cache::line::INV)))
 		{
-			for (unsigned other = 0; other < c.ways; ++other)
-				c.at(index, other).locked = other == way;
+			candidate.locked = 1;
 			if (c.ways > 1)
 				c.lru[index] = way ^ 1;
 			break;
@@ -2097,7 +2169,23 @@ bool mips1core_device_base::cache_refill(u32 address, bool icache)
 				std::get<0>(cache_lookup(refill_address, true, icache));
 		u32 const data = space(AS_PROGRAM).read_dword(refill_address);
 		if (handle_bus_error(icache))
+		{
+			// An R3900 instruction tag covers four words.  If any transfer
+			// in that block fails, none of the block may remain valid; blocks
+			// completed earlier in a longer refill remain usable.
+			if (m_multiply_to_gpr && icache)
+			{
+				u32 const block = refill_address & ~0x0f;
+				for (unsigned block_word = 0; block_word < 4; ++block_word)
+				{
+					auto [block_line, block_miss] =
+							cache_lookup(block + block_word * 4, false, true);
+					if (!block_miss)
+						block_line.invalidate();
+				}
+			}
 			return false;
+		}
 
 		line.update(data);
 		cache_lock(refill_address, icache);
@@ -2273,7 +2361,10 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 {
 	// alignment error
 	if (address & 3)
+	{
 		address_error(TR_FETCH, address);
+		return;
+	}
 
 	translate_result const t = translate(TR_FETCH, address, false);
 	if (t == ERROR)

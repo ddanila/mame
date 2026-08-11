@@ -1293,15 +1293,15 @@ void datarover_state::memory_map(address_map &map)
 {
 	common_memory_map(map);
 
-	map(0x13c00000, 0x13e963ff).rom().region("maincpu", 0);
+	map(0x13c00000, 0x13e963ff).mirror(0x40000000).rom().region("maincpu", 0);
 	map(0x13e96400, 0x13e965ff).rw(
 			FUNC(datarover_state::vector_page_r),
-			FUNC(datarover_state::vector_page_w));
-	map(0x13e96600, 0x143fffff).rom().region("maincpu", 0x00296600);
+			FUNC(datarover_state::vector_page_w)).mirror(0x40000000);
+	map(0x13e96600, 0x143fffff).mirror(0x40000000).rom().region("maincpu", 0x00296600);
 
 	// Architectural boot-vector alias, including the general exception
 	// vector at +0x180 and the R3900 debug exception vector at +0x200.
-	map(0x1fc00000, 0x1fc003ff).rom().region("maincpu", 0);
+	map(0x1fc00000, 0x1fc003ff).mirror(0x40000000).rom().region("maincpu", 0);
 }
 
 
@@ -1311,16 +1311,16 @@ void datarover_state::flash_memory_map(address_map &map)
 
 	map(0x13c00000, 0x13e963ff).rw(
 			FUNC(datarover_state::flash_r<0>),
-			FUNC(datarover_state::flash_w<0>));
+			FUNC(datarover_state::flash_w<0>)).mirror(0x40000000);
 	map(0x13e96400, 0x13e965ff).rw(
 			FUNC(datarover_state::vector_page_r),
-			FUNC(datarover_state::vector_page_w));
+			FUNC(datarover_state::vector_page_w)).mirror(0x40000000);
 	map(0x13e96600, 0x143fffff).rw(
 			FUNC(datarover_state::flash_r<0x00296600>),
-			FUNC(datarover_state::flash_w<0x00296600>));
+			FUNC(datarover_state::flash_w<0x00296600>)).mirror(0x40000000);
 	map(0x1fc00000, 0x1fc003ff).rw(
 			FUNC(datarover_state::flash_r<0>),
-			FUNC(datarover_state::flash_w<0>));
+			FUNC(datarover_state::flash_w<0>)).mirror(0x40000000);
 }
 
 
@@ -1328,29 +1328,31 @@ void datarover_state::common_memory_map(address_map &map)
 {
 	map.unmap_value_high();
 
-	map(0x00000000, 0x003fffff).ram().share("ram");
+	// DataRover does not decode the R3900 physical A30 output, so the CPU's
+	// 1 GiB-offset kuseg mapping aliases the same board resources.
+	map(0x00000000, 0x003fffff).mirror(0x40000000).ram().share("ram");
 
 	map(0x08000000, 0x0bffffff).rw(
 			FUNC(datarover_state::pccard_r<2>),
-			FUNC(datarover_state::pccard_w<2>));
+			FUNC(datarover_state::pccard_w<2>)).mirror(0x40000000);
 	map(0x0c000000, 0x0fffffff).rw(
 			FUNC(datarover_state::pccard_r<3>),
-			FUNC(datarover_state::pccard_w<3>));
+			FUNC(datarover_state::pccard_w<3>)).mirror(0x40000000);
 	map(0x10400000, 0x10400023).rw(
 			FUNC(datarover_state::glacier1_r),
-			FUNC(datarover_state::glacier1_w));
+			FUNC(datarover_state::glacier1_w)).mirror(0x40000000);
 	map(0x10800000, 0x10800023).rw(
 			FUNC(datarover_state::glacier2_r),
-			FUNC(datarover_state::glacier2_w));
+			FUNC(datarover_state::glacier2_w)).mirror(0x40000000);
 	map(0x10c00000, 0x10c001ff).rw(
 			FUNC(datarover_state::dino_r),
-			FUNC(datarover_state::dino_w));
+			FUNC(datarover_state::dino_w)).mirror(0x40000000);
 	map(0x24000000, 0x27ffffff).rw(
 			FUNC(datarover_state::pccard_r<0>),
-			FUNC(datarover_state::pccard_w<0>));
+			FUNC(datarover_state::pccard_w<0>)).mirror(0x40000000);
 	map(0x28000000, 0x2bffffff).rw(
 			FUNC(datarover_state::pccard_r<1>),
-			FUNC(datarover_state::pccard_w<1>));
+			FUNC(datarover_state::pccard_w<1>)).mirror(0x40000000);
 }
 
 

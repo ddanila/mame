@@ -163,6 +163,7 @@ protected:
 	u8 m_divide_cycles;
 	u8 m_gpr_delay;
 	bool m_debug_step_suppress;
+	bool m_deret_pending;
 	bool m_nmi_line;
 	bool m_nmi_pending;
 
