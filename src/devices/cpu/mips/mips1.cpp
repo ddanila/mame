@@ -1844,7 +1844,9 @@ void mips1core_device_base::handle_cop0(u32 const op)
 				handle_rfe();
 				break;
 			case 0x1f: // R3900 DERET
-				if (m_multiply_to_gpr && (m_cop0[COP0_Debug] & DEBUG_DM))
+				if (m_multiply_to_gpr
+						&& op == 0x4200'001f
+						&& (m_cop0[COP0_Debug] & DEBUG_DM))
 				{
 					m_branch_target = m_cop0[COP0_DEPC];
 					m_branch_state = BRANCH;

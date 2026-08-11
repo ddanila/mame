@@ -587,6 +587,7 @@ public:
 
 protected:
 	virtual void device_start() override ATTR_COLD;
+	virtual void device_post_load() override;
 
 	virtual bool is_readable() const noexcept override { return true; }
 	virtual bool is_writeable() const noexcept override { return true; }
@@ -615,6 +616,7 @@ private:
 	bool m_dirty = false;
 	bool m_magic_cap_storage = false;
 	bool m_legacy_storage = false;
+	bool m_present = false;
 };
 
 DEFINE_DEVICE_TYPE_PRIVATE(
@@ -642,7 +644,44 @@ void datarover_linear_pccard_device::device_start()
 	save_item(NAME(m_dirty));
 	save_item(NAME(m_magic_cap_storage));
 	save_item(NAME(m_legacy_storage));
-	set_present(exists());
+	m_present = exists();
+	save_item(NAME(m_present));
+	set_present(m_present);
+}
+
+void datarover_linear_pccard_device::device_post_load()
+{
+	bool const present = exists();
+	if (present != m_present)
+	{
+		if (present)
+		{
+			// Image mounts are external to save states.  If a card was inserted
+			// since this state was made, discard the restored empty buffer and
+			// reload the image that remains mounted.
+			fseek(0, SEEK_SET);
+			if (fread(m_data.data(), m_data.size()) != m_data.size())
+				fatalerror("Unable to restore mounted DataRover linear card image");
+
+			m_legacy_storage = has_legacy_storage_header();
+			m_magic_cap_storage =
+					std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
+					|| has_storage_header()
+					|| m_legacy_storage;
+		}
+		else
+		{
+			// Conversely, a state cannot resurrect storage after its backing
+			// image has been removed.
+			std::fill(m_data.begin(), m_data.end(), 0xff);
+			m_magic_cap_storage = false;
+			m_legacy_storage = false;
+		}
+		m_dirty = false;
+	}
+
+	m_present = present;
+	set_present(present);
 }
 
 void datarover_linear_pccard_device::set_present(bool present)
@@ -670,6 +709,7 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 			|| has_storage_header()
 			|| m_legacy_storage;
 	m_dirty = false;
+	m_present = true;
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
 }
@@ -688,6 +728,7 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to create card image");
 
 	m_dirty = false;
+	m_present = true;
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
 }
@@ -708,6 +749,7 @@ void datarover_linear_pccard_device::call_unload()
 	std::fill(m_data.begin(), m_data.end(), 0xff);
 	m_magic_cap_storage = false;
 	m_legacy_storage = false;
+	m_present = false;
 	set_present(false);
 }
 
