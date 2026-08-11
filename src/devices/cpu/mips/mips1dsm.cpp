@@ -159,7 +159,7 @@ uint32_t mips1_disassembler::dasm_cop(uint32_t pc, int cop, uint32_t op, std::os
 					case 0x08:  util::stream_format(stream, "tlbp");                                            break;
 					case 0x10:  util::stream_format(stream, "rfe");                                             break;
 					case 0x1f:  if (m_multiply_to_gpr)
-									{ util::stream_format(stream, "deret"); flags = STEP_OUT; }
+									{ util::stream_format(stream, "deret"); flags = STEP_OUT | step_over_extra(1); }
 								else
 									util::stream_format(stream, "cop%d  0x%07x", cop, op & 0x01ffffff);
 								break;

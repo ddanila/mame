@@ -84,7 +84,10 @@ protected:
 	void fetch(offs_t address, std::function<void(u32)> &&apply);
 
 	// cache
+	bool reverse_endian() const;
+	bool big_endian() const;
 	template <typename T> unsigned shift_factor(u32 address) const;
+	template <typename T> offs_t bus_address(offs_t address) const;
 	struct cache
 	{
 		cache(size_t size, unsigned ways = 1)

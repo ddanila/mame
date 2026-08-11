@@ -25,14 +25,13 @@ private:
 	u32 const m_opcode;
 };
 
-std::string disassemble_cache(bool r3900)
+std::pair<std::string, offs_t> disassemble(u32 opcode, bool r3900)
 {
-	constexpr u32 CACHE = 0xbc05'0000; // cache 5,0(zero)
-	opcode_buffer const buffer(CACHE);
+	opcode_buffer const buffer(opcode);
 	mips1_disassembler disassembler(r3900);
 	std::ostringstream output;
-	disassembler.disassemble(output, 0, buffer, buffer);
-	return output.str();
+	offs_t const result = disassembler.disassemble(output, 0, buffer, buffer);
+	return std::make_pair(output.str(), result);
 }
 
 } // anonymous namespace
@@ -40,6 +39,22 @@ std::string disassemble_cache(bool r3900)
 
 TEST_CASE("MIPS-I CACHE disassembly is R3900-specific", "[devices][cpu][mips]")
 {
-	CHECK(disassemble_cache(false) == ".word  0xbc050000 /*invalid*/");
-	CHECK(disassemble_cache(true) == "cache  0x5,0(0)");
+	constexpr u32 CACHE = 0xbc05'0000; // cache 5,0(zero)
+	CHECK(disassemble(CACHE, false).first == ".word  0xbc050000 /*invalid*/");
+	CHECK(disassemble(CACHE, true).first == "cache  0x5,0(0)");
+}
+
+TEST_CASE("R3900 DERET debugger flags include its delay slot", "[devices][cpu][mips]")
+{
+	auto const [text, result] = disassemble(0x4200'001f, true);
+	CHECK(text == "deret");
+	CHECK((result & util::disasm_interface::STEP_OUT) != 0);
+	CHECK((result & util::disasm_interface::OVERINSTMASK)
+			== util::disasm_interface::step_over_extra(1));
+}
+
+TEST_CASE("R3900 RFE disassembly requires the canonical encoding", "[devices][cpu][mips]")
+{
+	CHECK(disassemble(0x4200'0010, true).first == "rfe");
+	CHECK(disassemble(0x4200'0030, true).first == "cop0  0x0000030");
 }

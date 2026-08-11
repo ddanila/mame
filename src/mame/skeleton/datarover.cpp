@@ -46,9 +46,12 @@
 #include "screen.h"
 #include "speaker.h"
 
+#include "util/hashing.h"
+
 #include "datarover840.lh"
 
 #include <array>
+#include <cstring>
 #include <vector>
 
 #define LOG_UART (1U << 1)
@@ -607,6 +610,8 @@ private:
 	static constexpr u32 CARD_SIZE = 8 * 1024 * 1024;
 	static constexpr u32 LEGACY_WRAPPER_SIZE = 0x70;
 	static constexpr u32 LEGACY_CIS_OFFSET = 0x0c;
+	std::array<u8, 20> mounted_image_identity() const;
+	bool load_image_data();
 	void set_present(bool present);
 	void flush();
 	bool has_storage_header() const;
@@ -617,6 +622,7 @@ private:
 	bool m_magic_cap_storage = false;
 	bool m_legacy_storage = false;
 	bool m_present = false;
+	std::array<u8, 20> m_image_identity{};
 };
 
 DEFINE_DEVICE_TYPE_PRIVATE(
@@ -646,28 +652,25 @@ void datarover_linear_pccard_device::device_start()
 	save_item(NAME(m_legacy_storage));
 	m_present = exists();
 	save_item(NAME(m_present));
+	m_image_identity = mounted_image_identity();
+	save_item(NAME(m_image_identity));
 	set_present(m_present);
 }
 
 void datarover_linear_pccard_device::device_post_load()
 {
 	bool const present = exists();
-	if (present != m_present)
+	std::array<u8, 20> const image_identity = mounted_image_identity();
+	if ((present != m_present)
+			|| (present && image_identity != m_image_identity))
 	{
 		if (present)
 		{
-			// Image mounts are external to save states.  If a card was inserted
-			// since this state was made, discard the restored empty buffer and
-			// reload the image that remains mounted.
-			fseek(0, SEEK_SET);
-			if (fread(m_data.data(), m_data.size()) != m_data.size())
+			// Image mounts are external to save states.  Discard restored data
+			// whenever it belongs to a different card than the mounted image;
+			// retaining it could later flush one card's contents into another.
+			if (!load_image_data())
 				fatalerror("Unable to restore mounted DataRover linear card image");
-
-			m_legacy_storage = has_legacy_storage_header();
-			m_magic_cap_storage =
-					std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
-					|| has_storage_header()
-					|| m_legacy_storage;
 		}
 		else
 		{
@@ -681,7 +684,35 @@ void datarover_linear_pccard_device::device_post_load()
 	}
 
 	m_present = present;
+	m_image_identity = image_identity;
 	set_present(present);
+}
+
+std::array<u8, 20> datarover_linear_pccard_device::mounted_image_identity() const
+{
+	std::array<u8, 20> result{};
+	char const *const image_name = filename();
+	if (image_name)
+	{
+		util::sha1_t const digest =
+				util::sha1_creator::simple(image_name, std::strlen(image_name));
+		std::copy(std::begin(digest.m_raw), std::end(digest.m_raw), result.begin());
+	}
+	return result;
+}
+
+bool datarover_linear_pccard_device::load_image_data()
+{
+	fseek(0, SEEK_SET);
+	if (fread(m_data.data(), m_data.size()) != m_data.size())
+		return false;
+
+	m_legacy_storage = has_legacy_storage_header();
+	m_magic_cap_storage =
+			std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
+			|| has_storage_header()
+			|| m_legacy_storage;
+	return true;
 }
 
 void datarover_linear_pccard_device::set_present(bool present)
@@ -700,16 +731,12 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 				image_error::INVALIDLENGTH,
 				"DataRover linear card images must be exactly 8 MiB");
 
-	if (fread(m_data.data(), m_data.size()) != m_data.size())
+	if (!load_image_data())
 		return std::make_pair(image_error::UNSPECIFIED, "Unable to read card image");
 
-	m_legacy_storage = has_legacy_storage_header();
-	m_magic_cap_storage =
-			std::all_of(m_data.begin(), m_data.end(), [](u8 value) { return value == 0xff; })
-			|| has_storage_header()
-			|| m_legacy_storage;
 	m_dirty = false;
 	m_present = true;
+	m_image_identity = mounted_image_identity();
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
 }
@@ -729,6 +756,7 @@ std::pair<std::error_condition, std::string> datarover_linear_pccard_device::cal
 
 	m_dirty = false;
 	m_present = true;
+	m_image_identity = mounted_image_identity();
 	set_present(true);
 	return std::make_pair(std::error_condition(), std::string());
 }
@@ -750,6 +778,7 @@ void datarover_linear_pccard_device::call_unload()
 	m_magic_cap_storage = false;
 	m_legacy_storage = false;
 	m_present = false;
+	m_image_identity.fill(0);
 	set_present(false);
 }
 

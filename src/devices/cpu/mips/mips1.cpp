@@ -1841,7 +1841,10 @@ void mips1core_device_base::handle_cop0(u32 const op)
 					generate_exception(EXCEPTION_INVALIDOP);
 				break;
 			case 0x10: // RFE
-				handle_rfe();
+				if (m_multiply_to_gpr && op != 0x4200'0010)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else
+					handle_rfe();
 				break;
 			case 0x1f: // R3900 DERET
 				if (m_multiply_to_gpr
@@ -1999,7 +2002,7 @@ void mips1core_device_base::lwl(u32 const op)
 	offs_t const offset = SIMMVAL + m_r[RSREG];
 	load<u32, false>(offset, [this, op, offset](u32 temp)
 	{
-		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 3 : 0)) << 3;
+		unsigned const shift = ((offset & 3) ^ (big_endian() ? 0 : 3)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU << shift)) | (temp << shift);
 		set_gpr_delay(RTREG);
@@ -2011,7 +2014,7 @@ void mips1core_device_base::lwr(u32 const op)
 	offs_t const offset = SIMMVAL + m_r[RSREG];
 	load<u32, false>(offset, [this, op, offset](u32 temp)
 	{
-		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 0 : 3)) << 3;
+		unsigned const shift = ((offset & 3) ^ (big_endian() ? 3 : 0)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU >> shift)) | (temp >> shift);
 		set_gpr_delay(RTREG);
@@ -2021,7 +2024,7 @@ void mips1core_device_base::lwr(u32 const op)
 void mips1core_device_base::swl(u32 const op)
 {
 	offs_t const offset = SIMMVAL + m_r[RSREG];
-	unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 3 : 0)) << 3;
+	unsigned const shift = ((offset & 3) ^ (big_endian() ? 0 : 3)) << 3;
 
 	store<u32, false>(offset, m_r[RTREG] >> shift, 0xffffffffU >> shift);
 }
@@ -2029,7 +2032,7 @@ void mips1core_device_base::swl(u32 const op)
 void mips1core_device_base::swr(u32 const op)
 {
 	offs_t const offset = SIMMVAL + m_r[RSREG];
-	unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 0 : 3)) << 3;
+	unsigned const shift = ((offset & 3) ^ (big_endian() ? 3 : 0)) << 3;
 
 	store<u32, false>(offset, m_r[RTREG] << shift, 0xffffffffU << shift);
 }
@@ -2196,16 +2199,37 @@ bool mips1core_device_base::cache_refill(u32 address, bool icache)
 	return true;
 }
 
+bool mips1core_device_base::reverse_endian() const
+{
+	return (SR & SR_RE) && (SR & SR_KUc);
+}
+
+bool mips1core_device_base::big_endian() const
+{
+	return (m_endianness == ENDIANNESS_BIG) != reverse_endian();
+}
+
 // compute bit position of sub-unit within a word given endianness and address
 template <typename T>
 unsigned mips1core_device_base::shift_factor(u32 address) const
 {
 	if constexpr (sizeof(T) == 1)
-		return ((m_endianness == ENDIANNESS_BIG) ? (address & 3) ^ 3 : (address & 3)) * 8;
+		return (big_endian() ? (address & 3) ^ 3 : (address & 3)) * 8;
 	else if constexpr (sizeof(T) == 2)
-		return ((m_endianness == ENDIANNESS_BIG) ? (address & 2) ^ 2 : (address & 2)) * 8;
+		return (big_endian() ? (address & 2) ^ 2 : (address & 2)) * 8;
 	else
 		return 0;
+}
+
+// Reverse-endian user accesses select the opposite byte or halfword lane on
+// the fixed-endian memory interface.  Aligned words retain their bit numbering.
+template <typename T>
+offs_t mips1core_device_base::bus_address(offs_t address) const
+{
+	if constexpr (sizeof(T) < 4)
+		return reverse_endian() ? address ^ (4 - sizeof(T)) : address;
+	else
+		return address;
 }
 
 template <typename T, bool Aligned, typename U>
@@ -2247,9 +2271,9 @@ std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> mi
 			if constexpr (sizeof(T) == 4)
 				data = space(AS_PROGRAM).read_dword(address);
 			else if constexpr (sizeof(T) == 2)
-				data = space(AS_PROGRAM).read_word(address);
+				data = space(AS_PROGRAM).read_word(bus_address<T>(address));
 			else if constexpr (sizeof(T) == 1)
-				data = space(AS_PROGRAM).read_byte(address);
+				data = space(AS_PROGRAM).read_byte(bus_address<T>(address));
 
 			if (handle_bus_error(false))
 				return;
@@ -2338,9 +2362,9 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 			if constexpr (sizeof(T) == 4)
 				space(AS_PROGRAM).write_dword(address, T(data), mem_mask);
 			else if constexpr (sizeof(T) == 2)
-				space(AS_PROGRAM).write_word(address, T(data), mem_mask);
+				space(AS_PROGRAM).write_word(bus_address<T>(address), T(data), mem_mask);
 			else if constexpr (sizeof(T) == 1)
-				space(AS_PROGRAM).write_byte(address, T(data));
+				space(AS_PROGRAM).write_byte(bus_address<T>(address), T(data));
 
 			if (handle_bus_error(false))
 				return;
