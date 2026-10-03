@@ -17,11 +17,12 @@ public:
 	void berr_w(int state) { m_bus_error = bool(state); }
 
 protected:
-	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws);
+	mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr = false, unsigned dcache_ways = 1);
 
 	// device_t implementation
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void state_import(device_state_entry const &entry) override;
 
 	// device_execute_interface implementation
 	virtual u32 execute_min_cycles() const noexcept override { return 1; }
@@ -38,17 +39,36 @@ protected:
 
 	// exceptions
 	void generate_exception(u32 exception, bool refill = false);
+	void generate_nmi_exception();
+	void generate_debug_exception(u32 cause);
+	bool handle_bus_error(bool instruction);
 	void address_error(int intention, u32 const address);
+	virtual void exception_enter();
 
 	// cop0
 	virtual void handle_cop0(u32 const op);
+	virtual void handle_rfe();
 	virtual u32 get_cop0_reg(unsigned const reg);
 	virtual void set_cop0_reg(unsigned const reg, u32 const data);
 
 	// other coprocessors
+	void handle_cop_branch(unsigned cop, u32 const op);
 	virtual void handle_cop1(u32 const op);
 	virtual void handle_cop2(u32 const op);
 	virtual void handle_cop3(u32 const op);
+	virtual void handle_special2(u32 const op);
+	virtual void handle_cache(u32 const op);
+	virtual bool cache_auto_lock(bool icache) const;
+	virtual unsigned cache_refill_words(bool icache) const;
+	virtual bool cache_store_allocate() const;
+
+	// TX39 pipeline interlocks
+	bool reads_gpr(u32 op, unsigned reg) const;
+	void gpr_interlock(u32 op);
+	void set_gpr_delay(unsigned reg);
+	void cancel_divide();
+	void divide_interlock();
+	void advance_divide(unsigned cycles);
 
 	// load/store left/right opcodes
 	void lwl(u32 const op);
@@ -64,11 +84,15 @@ protected:
 	void fetch(offs_t address, std::function<void(u32)> &&apply);
 
 	// cache
+	bool reverse_endian() const;
+	bool big_endian() const;
 	template <typename T> unsigned shift_factor(u32 address) const;
+	template <typename T> offs_t bus_address(offs_t address) const;
 	struct cache
 	{
-		cache(size_t size)
+		cache(size_t size, unsigned ways = 1)
 			: size(size)
+			, ways(ways)
 		{
 		}
 
@@ -88,15 +112,40 @@ protected:
 
 			u32 tag;
 			u32 data;
+			u8 locked;
 		};
 
 		size_t lines() const { return size / 4; }
-		void start() { line = std::make_unique<struct line[]>(lines()); }
+		size_t sets() const { return lines() / ways; }
+		size_t way_size() const { return size / ways; }
+		unsigned index(u32 address) const { return (address >> 2) & (sets() - 1); }
+		struct line &at(unsigned index, unsigned way) const { return line[index * ways + way]; }
+		void start()
+		{
+			line = std::make_unique<struct line[]>(lines());
+			lru = std::make_unique<u8[]>(sets());
+		}
+		void reset()
+		{
+			for (unsigned index = 0; index < sets(); ++index)
+			{
+				lru[index] = 0;
+				for (unsigned way = 0; way < ways; ++way)
+				{
+					at(index, way).invalidate();
+					at(index, way).locked = 0;
+				}
+			}
+		}
 
 		size_t const size;
+		unsigned const ways;
 		std::unique_ptr<struct line[]> line;
+		std::unique_ptr<u8[]> lru;
 	};
 	std::tuple<struct cache::line &, bool> cache_lookup(u32 address, bool invalidate, bool icache = false);
+	void cache_lock(u32 address, bool icache = false);
+	bool cache_refill(u32 address, bool icache);
 
 	// address spaces
 	address_space_config const m_program_config_be;
@@ -105,12 +154,21 @@ protected:
 	// configuration
 	u32 const m_cpurev;
 	endianness_t m_endianness;
+	bool const m_multiply_to_gpr;
 
 	// core registers
 	u32 m_pc;
 	u32 m_r[32];
 	u32 m_hi;
 	u32 m_lo;
+	u32 m_divide_hi;
+	u32 m_divide_lo;
+	u8 m_divide_cycles;
+	u8 m_gpr_delay;
+	bool m_debug_step_suppress;
+	bool m_deret_pending;
+	bool m_nmi_line;
+	bool m_nmi_pending;
 
 	// cop0 registers
 	u32 m_cop0[32];
@@ -123,6 +181,7 @@ protected:
 		DELAY     = 1, // delay slot instruction active
 		BRANCH    = 2, // branch instruction active
 		EXCEPTION = 3, // exception triggered
+		NULLIFY   = 4, // branch-likely delay slot skipped
 	}
 	m_branch_state;
 	u32 m_branch_target;
@@ -249,6 +308,29 @@ public:
 	r3081_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock, size_t icache_size = 16384, size_t dcache_size = 4096);
 };
 
+class r3900_device : public mips1core_device_base
+{
+public:
+	r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
+
+	// Notify the core that an external bus master changed physical memory.
+	void invalidate_data_cache(u32 address, u32 bytes);
+
+protected:
+	virtual void device_start() override ATTR_COLD;
+	virtual void device_reset() override ATTR_COLD;
+	virtual translate_result translate(int intention, offs_t &address, bool debug) override;
+	virtual void exception_enter() override;
+	virtual void handle_rfe() override;
+	virtual u32 get_cop0_reg(unsigned const reg) override;
+	virtual void set_cop0_reg(unsigned const reg, u32 const data) override;
+	virtual void handle_special2(u32 const op) override;
+	virtual void handle_cache(u32 const op) override;
+	virtual bool cache_auto_lock(bool icache) const override;
+	virtual unsigned cache_refill_words(bool icache) const override;
+	virtual bool cache_store_allocate() const override;
+};
+
 class iop_device : public mips1core_device_base
 {
 public:
@@ -265,6 +347,7 @@ DECLARE_DEVICE_TYPE(R3052,       r3052_device)
 DECLARE_DEVICE_TYPE(R3052E,      r3052e_device)
 DECLARE_DEVICE_TYPE(R3071,       r3071_device)
 DECLARE_DEVICE_TYPE(R3081,       r3081_device)
+DECLARE_DEVICE_TYPE(R3900,       r3900_device)
 DECLARE_DEVICE_TYPE(SONYPS2_IOP, iop_device)
 
 #endif // MAME_CPU_MIPS_MIPS1_H

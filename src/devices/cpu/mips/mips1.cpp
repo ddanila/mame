@@ -33,6 +33,8 @@ enum registers : unsigned
 	MIPS1_LO,
 	MIPS1_FCR30,
 	MIPS1_FCR31,
+	MIPS1_NMI,
+	MIPS1_BERR,
 };
 
 enum exception : u32
@@ -62,8 +64,9 @@ constexpr u8 COP0_Index    = 0;
 constexpr u8 COP0_Random   = 1;
 constexpr u8 COP0_EntryLo  = 2;
 constexpr u8 COP0_BusCtrl  = 2;  // r3041 only
-constexpr u8 COP0_Config   = 3;  // r3041/r3071/r3081 only
+constexpr u8 COP0_Config   = 3;  // r3041/r3071/r3081/r3900 only
 constexpr u8 COP0_Context  = 4;
+constexpr u8 COP0_Cache    = 7;  // r3900 only
 constexpr u8 COP0_BadVAddr = 8;
 constexpr u8 COP0_Count    = 9;  // r3041 only
 constexpr u8 COP0_EntryHi  = 10;
@@ -73,6 +76,12 @@ constexpr u8 COP0_Status   = 12;
 constexpr u8 COP0_Cause    = 13;
 constexpr u8 COP0_EPC      = 14;
 constexpr u8 COP0_PRId     = 15;
+constexpr u8 COP0_Debug    = 16; // r3900 only
+constexpr u8 COP0_DEPC     = 17; // r3900 only
+
+constexpr u32 CONFIG_HALT = 0x0000'0100;
+constexpr u32 CONFIG_DOZE = 0x0000'0200;
+constexpr u32 CONFIG_POWER_DOWN = CONFIG_HALT | CONFIG_DOZE;
 
 enum sr_mask : u32
 {
@@ -107,6 +116,7 @@ enum sr_mask : u32
 	SR_KUIEpc = 0x0000000f, // previous and current interrupt enable and user mode bits
 	SR_KUIEop = 0x0000003c, // old and previous interrupt enable and user mode bits
 	SR_IM     = 0x0000ff00, // all interrupt mask bits
+	SR_NMI    = 0x00100000, // R3900 non-maskable interrupt status
 };
 
 enum cause_mask : u32
@@ -125,6 +135,18 @@ enum cause_mask : u32
 	CAUSE_BD      = 0x80000000, // branch delay
 
 	CAUSE_IPEX    = 0x0000fc00, // external interrupt pending
+};
+
+enum debug_mask : u32
+{
+	DEBUG_DBD = 0x8000'0000, // debug branch delay
+	DEBUG_DM  = 0x4000'0000, // debug mode
+	DEBUG_NIS = 0x0000'4000, // coincident non-maskable interrupt
+	DEBUG_OES = 0x0000'1000, // coincident ordinary exception
+	DEBUG_BSF = 0x0000'0400, // bus error exception flag
+	DEBUG_SST = 0x0000'0100, // single step enable
+	DEBUG_DBP = 0x0000'0002, // debug breakpoint
+	DEBUG_DSS = 0x0000'0001, // debug single step
 };
 
 enum entryhi_mask : u32
@@ -206,19 +228,29 @@ DEFINE_DEVICE_TYPE(R3052,       r3052_device,     "r3052",   "IDT R3052")
 DEFINE_DEVICE_TYPE(R3052E,      r3052e_device,    "r3052e",  "IDT R3052E")
 DEFINE_DEVICE_TYPE(R3071,       r3071_device,     "r3071",   "IDT R3071")
 DEFINE_DEVICE_TYPE(R3081,       r3081_device,     "r3081",   "IDT R3081")
+DEFINE_DEVICE_TYPE(R3900,       r3900_device,     "r3900",    "Toshiba R3900")
 DEFINE_DEVICE_TYPE(SONYPS2_IOP, iop_device,       "sonyiop", "Sony Playstation 2 IOP")
 
 ALLOW_SAVE_TYPE(mips1core_device_base::branch_state);
 
-mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws)
+mips1core_device_base::mips1core_device_base(machine_config const &mconfig, device_type type, char const *tag, device_t *owner, u32 clock, u32 cpurev, size_t icache_size, size_t dcache_size, bool cache_pws, bool multiply_to_gpr, unsigned dcache_ways)
 	: cpu_device(mconfig, type, tag, owner, clock)
 	, m_program_config_be("program", ENDIANNESS_BIG, 32, 32)
 	, m_program_config_le("program", ENDIANNESS_LITTLE, 32, 32)
 	, m_cpurev(cpurev)
 	, m_endianness(ENDIANNESS_BIG)
+	, m_multiply_to_gpr(multiply_to_gpr)
+	, m_divide_hi(0)
+	, m_divide_lo(0)
+	, m_divide_cycles(0)
+	, m_gpr_delay(0)
+	, m_debug_step_suppress(false)
+	, m_deret_pending(false)
+	, m_nmi_line(false)
+	, m_nmi_pending(false)
 	, m_icount(0)
 	, m_icache(icache_size)
-	, m_dcache(dcache_size)
+	, m_dcache(dcache_size, dcache_ways)
 	, m_cache((icache_size && dcache_size) ? CACHED : UNCACHED)
 	, m_cache_pws(cache_pws)
 	, m_in_brcond(*this, 0)
@@ -282,6 +314,37 @@ r3081_device::r3081_device(machine_config const &mconfig, char const *tag, devic
 	set_fpu(0x0300);
 }
 
+r3900_device::r3900_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+	: mips1core_device_base(mconfig, R3900, tag, owner, clock, 0x2200, 4096, 1024, true, true, 2)
+{
+}
+
+void r3900_device::device_start()
+{
+	mips1core_device_base::device_start();
+
+	state_add(MIPS1_COP0 + COP0_Config, "Config", m_cop0[COP0_Config]);
+	state_add(MIPS1_COP0 + COP0_Cache, "Cache", m_cop0[COP0_Cache]);
+	state_add(MIPS1_COP0 + COP0_Debug, "Debug", m_cop0[COP0_Debug]);
+	state_add(MIPS1_COP0 + COP0_DEPC, "DEPC", m_cop0[COP0_DEPC]);
+	state_add(MIPS1_NMI, "NMI", m_nmi_pending).mask(1);
+	state_add(MIPS1_BERR, "BERR", m_bus_error).mask(1);
+}
+
+void r3900_device::device_reset()
+{
+	mips1core_device_base::device_reset();
+
+	// The TMPR3902U has a 4 KiB instruction cache and 1 KiB data cache.
+	// Both caches are enabled after reset; all other writable fields and
+	// all cache auto-lock modes are clear.
+	m_cop0[COP0_Config] = 0x0010'0030;
+	m_cop0[COP0_Cache] = 0;
+	m_cop0[COP0_Debug] = 0;
+	m_cop0[COP0_DEPC] = 0;
+	set_clock_scale(1.0);
+}
+
 iop_device::iop_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: mips1core_device_base(mconfig, SONYPS2_IOP, tag, owner, clock, 0x001f, 4096, 1024, false)
 {
@@ -294,10 +357,10 @@ void mips1core_device_base::device_start()
 	set_icountptr(m_icount);
 
 	// register our state for the debugger
-	state_add(STATE_GENPC,      "GENPC",     m_pc).noshow();
+	state_add(STATE_GENPC,      "GENPC",     m_pc).callimport().noshow();
 	state_add(STATE_GENPCBASE,  "CURPC",     m_pc).noshow();
 
-	state_add(MIPS1_PC,                   "PC",        m_pc);
+	state_add(MIPS1_PC,                   "PC",        m_pc).callimport();
 	state_add(MIPS1_COP0 + COP0_Status,   "SR",        m_cop0[COP0_Status]);
 
 	for (unsigned i = 0; i < std::size(m_r); i++)
@@ -315,6 +378,15 @@ void mips1core_device_base::device_start()
 	save_item(NAME(m_pc));
 	save_item(NAME(m_hi));
 	save_item(NAME(m_lo));
+	save_item(NAME(m_divide_hi));
+	save_item(NAME(m_divide_lo));
+	save_item(NAME(m_divide_cycles));
+	save_item(NAME(m_gpr_delay));
+	save_item(NAME(m_debug_step_suppress));
+	save_item(NAME(m_deret_pending));
+	save_item(NAME(m_nmi_line));
+	save_item(NAME(m_nmi_pending));
+	save_item(NAME(m_bus_error));
 	save_item(NAME(m_r));
 	save_item(NAME(m_cop0));
 	save_item(NAME(m_branch_state));
@@ -332,8 +404,23 @@ void mips1core_device_base::device_start()
 
 	save_pointer(STRUCT_MEMBER(m_icache.line, tag), m_icache.lines());
 	save_pointer(STRUCT_MEMBER(m_icache.line, data), m_icache.lines());
+	save_pointer(STRUCT_MEMBER(m_icache.line, locked), m_icache.lines());
+	save_pointer(NAME(m_icache.lru), m_icache.sets());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, tag), m_dcache.lines());
 	save_pointer(STRUCT_MEMBER(m_dcache.line, data), m_dcache.lines());
+	save_pointer(STRUCT_MEMBER(m_dcache.line, locked), m_dcache.lines());
+	save_pointer(NAME(m_dcache.lru), m_dcache.sets());
+}
+
+void mips1core_device_base::state_import(device_state_entry const &entry)
+{
+	if (entry.index() == STATE_GENPC || entry.index() == MIPS1_PC)
+	{
+		m_branch_state = NONE;
+		m_branch_target = 0;
+		m_debug_step_suppress = false;
+		m_deret_pending = false;
+	}
 }
 
 void r3041_device::device_start()
@@ -357,6 +444,14 @@ void mips1core_device_base::device_reset()
 	// initialize the state
 	m_pc = 0xbfc00000;
 	m_branch_state = NONE;
+	m_divide_cycles = 0;
+	m_gpr_delay = 0;
+	m_debug_step_suppress = false;
+	m_deret_pending = false;
+	m_nmi_line = false;
+	m_nmi_pending = false;
+	m_icache.reset();
+	m_dcache.reset();
 
 	// non-tlb devices have tlb shut down
 	m_cop0[COP0_Status] = SR_BEV | SR_TS;
@@ -377,12 +472,97 @@ void mips1core_device_base::execute_run()
 	// core execution loop
 	while (m_icount-- > 0)
 	{
+		// Halt and Doze retain the pipeline until a physical interrupt, NMI
+		// or reset clears the corresponding R3900 Config bit.  Check every
+		// iteration because MTC0 may enter a mode within this timeslice.
+		if (m_multiply_to_gpr
+				&& (m_cop0[COP0_Config] & CONFIG_POWER_DOWN))
+		{
+			m_icount = 0;
+			return;
+		}
+
+		int const cycle_start = m_icount;
+		bool divide_started = false;
+		bool const debug_step_suppressed = m_debug_step_suppress;
+		bool const deret_delay =
+				m_deret_pending && (m_branch_state == DELAY);
+
 		// debugging
 		debugger_instruction_hook(m_pc);
 
-		// fetch instruction
-		fetch(m_pc, [this](u32 const op)
+		bool const debug_step =
+				m_multiply_to_gpr
+				&& !debug_step_suppressed
+				&& (m_branch_state != DELAY)
+				&& (m_cop0[COP0_Debug] & DEBUG_SST)
+				&& !(m_cop0[COP0_Debug] & DEBUG_DM);
+		bool const nmi =
+				m_multiply_to_gpr
+				&& m_nmi_pending
+				&& !(m_cop0[COP0_Debug] & DEBUG_DM);
+
+		if (debug_step)
 		{
+			// The TX39 records an exception coincident with a debug single
+			// step in the ordinary exception registers, then
+			// enters debug mode with DEPC still naming the stepped boundary.
+			u32 const debug_pc = m_pc;
+			branch_state const debug_branch_state = m_branch_state;
+			u32 coincident = 0;
+			bool enter_debug = true;
+			if (nmi)
+			{
+				generate_nmi_exception();
+				coincident = DEBUG_NIS;
+			}
+			else if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
+			{
+				for (int irqline = 0; irqline < 6; irqline++)
+					if (CAUSE & SR & (CAUSE_IPEX0 << irqline))
+					{
+						standard_irq_callback(irqline, m_pc);
+						break;
+					}
+				generate_exception(EXCEPTION_INTERRUPT);
+				coincident = DEBUG_OES;
+			}
+			else
+			{
+				// A single-step debug exception is taken after the instruction
+				// fetch.  Preserve a coincident fetch exception (notably AdEL
+				// for a misaligned branch target) in the ordinary exception
+				// registers before entering debug mode.
+				fetch(debug_pc, [](u32) { });
+				if (m_branch_state == EXCEPTION)
+				{
+					if ((CAUSE & CAUSE_EXCCODE) == EXCEPTION_ADDRLOAD)
+						coincident = DEBUG_OES;
+					else
+						enter_debug = false;
+				}
+			}
+
+			if (enter_debug && coincident)
+			{
+				m_pc = debug_pc;
+				m_branch_state = debug_branch_state;
+			}
+			if (enter_debug)
+				generate_debug_exception(DEBUG_DSS | coincident);
+		}
+		else if (nmi)
+			generate_nmi_exception();
+		else
+		{
+			// fetch instruction
+			u32 const fetch_pc = m_pc;
+			branch_state const fetch_branch_state = m_branch_state;
+			bool instruction_fetched = false;
+			fetch(m_pc, [this, &divide_started, &instruction_fetched](u32 const op)
+			{
+			instruction_fetched = true;
+
 			// check for interrupts
 			if ((CAUSE & SR & SR_IM) && (SR & SR_IEc))
 			{
@@ -398,6 +578,11 @@ void mips1core_device_base::execute_run()
 				generate_exception(EXCEPTION_INTERRUPT);
 				return;
 			}
+
+			// A TX39 load or three-operand multiply writes its GPR one pipeline
+			// stage later.  Only an immediately following dependent instruction
+			// stalls; independent instructions continue at one per cycle.
+			gpr_interlock(op);
 
 			// decode and execute instruction
 			switch (op >> 26)
@@ -438,16 +623,32 @@ void mips1core_device_base::execute_run()
 				case 0x0d: // BREAK
 					generate_exception(EXCEPTION_BREAK);
 					break;
+				case 0x0e: // R3900 SDBBP
+					if (m_multiply_to_gpr)
+						generate_debug_exception(DEBUG_DBP);
+					else
+						generate_exception(EXCEPTION_INVALIDOP);
+					break;
+				case 0x0f: // R3900 SYNC
+					// Memory accesses and cache refills are synchronous in
+					// this interpreter, so there is nothing left to drain.
+					if (!m_multiply_to_gpr || (op & 0x03ff'ffc0))
+						generate_exception(EXCEPTION_INVALIDOP);
+					break;
 				case 0x10: // MFHI
+					divide_interlock();
 					m_r[RDREG] = m_hi;
 					break;
 				case 0x11: // MTHI
+					cancel_divide();
 					m_hi = m_r[RSREG];
 					break;
 				case 0x12: // MFLO
+					divide_interlock();
 					m_r[RDREG] = m_lo;
 					break;
 				case 0x13: // MTLO
+					cancel_divide();
 					m_lo = m_r[RSREG];
 					break;
 				case 0x18: // MULT
@@ -456,7 +657,13 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
-						m_icount -= 11;
+						if (m_multiply_to_gpr)
+						{
+							m_r[RDREG] = m_lo;
+							set_gpr_delay(RDREG);
+						}
+						else
+							m_icount -= 11;
 					}
 					break;
 				case 0x19: // MULTU
@@ -465,24 +672,73 @@ void mips1core_device_base::execute_run()
 
 						m_lo = product;
 						m_hi = product >> 32;
-						m_icount -= 11;
+						if (m_multiply_to_gpr)
+						{
+							m_r[RDREG] = m_lo;
+							set_gpr_delay(RDREG);
+						}
+						else
+							m_icount -= 11;
 					}
 					break;
 				case 0x1a: // DIV
-					if (m_r[RTREG])
+					if (m_multiply_to_gpr)
 					{
-						m_lo = s32(m_r[RSREG]) / s32(m_r[RTREG]);
-						m_hi = s32(m_r[RSREG]) % s32(m_r[RTREG]);
+						cancel_divide();
+						m_divide_lo = m_lo;
+						m_divide_hi = m_hi;
+						if (m_r[RTREG])
+						{
+							if (m_r[RSREG] == 0x8000'0000U
+									&& m_r[RTREG] == 0xffff'ffffU)
+							{
+								m_divide_lo = 0x8000'0000U;
+								m_divide_hi = 0;
+							}
+							else
+							{
+								m_divide_lo =
+										s32(m_r[RSREG]) / s32(m_r[RTREG]);
+								m_divide_hi =
+										s32(m_r[RSREG]) % s32(m_r[RTREG]);
+							}
+						}
+						m_divide_cycles = 35;
+						divide_started = true;
 					}
-					m_icount -= 34;
+					else
+					{
+						if (m_r[RTREG])
+						{
+							m_lo = s32(m_r[RSREG]) / s32(m_r[RTREG]);
+							m_hi = s32(m_r[RSREG]) % s32(m_r[RTREG]);
+						}
+						m_icount -= 34;
+					}
 					break;
 				case 0x1b: // DIVU
-					if (m_r[RTREG])
+					if (m_multiply_to_gpr)
 					{
-						m_lo = m_r[RSREG] / m_r[RTREG];
-						m_hi = m_r[RSREG] % m_r[RTREG];
+						cancel_divide();
+						m_divide_lo = m_lo;
+						m_divide_hi = m_hi;
+						if (m_r[RTREG])
+						{
+							m_divide_lo = m_r[RSREG] / m_r[RTREG];
+							m_divide_hi = m_r[RSREG] % m_r[RTREG];
+						}
+						m_divide_cycles = 35;
+						divide_started = true;
 					}
-					m_icount -= 34;
+					else
+					{
+						if (m_r[RTREG])
+						{
+							m_lo = m_r[RSREG] / m_r[RTREG];
+							m_hi = m_r[RSREG] % m_r[RTREG];
+						}
+						m_icount -= 34;
+					}
 					break;
 				case 0x20: // ADD
 					{
@@ -547,7 +803,7 @@ void mips1core_device_base::execute_run()
 				 * instruction if the branch is not taken, whereas the former
 				 * execute the delay slot instruction regardless.
 				 */
-				switch (RTREG & 0x1d)
+				switch (m_multiply_to_gpr ? RTREG : (RTREG & 0x1d))
 				{
 				case 0x00: // BLTZ
 					if (s32(m_r[RSREG]) < 0)
@@ -564,20 +820,64 @@ void mips1core_device_base::execute_run()
 					}
 					break;
 				case 0x10: // BLTZAL
+					if (m_multiply_to_gpr)
+						m_r[31] = m_pc + 8;
 					if (s32(m_r[RSREG]) < 0)
 					{
 						m_branch_state = BRANCH;
 						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
+						if (!m_multiply_to_gpr)
+							m_r[31] = m_pc + 8;
 					}
 					break;
 				case 0x11: // BGEZAL
+					if (m_multiply_to_gpr)
+						m_r[31] = m_pc + 8;
 					if (s32(m_r[RSREG]) >= 0)
 					{
 						m_branch_state = BRANCH;
 						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-						m_r[31] = m_pc + 8;
+						if (!m_multiply_to_gpr)
+							m_r[31] = m_pc + 8;
 					}
+					break;
+				case 0x02: // R3900 BLTZL
+					if (s32(m_r[RSREG]) < 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x03: // R3900 BGEZL
+					if (s32(m_r[RSREG]) >= 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x12: // R3900 BLTZALL
+					m_r[31] = m_pc + 8;
+					if (s32(m_r[RSREG]) < 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
+					break;
+				case 0x13: // R3900 BGEZALL
+					m_r[31] = m_pc + 8;
+					if (s32(m_r[RSREG]) >= 0)
+					{
+						m_branch_state = BRANCH;
+						m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+					}
+					else
+						m_branch_state = NULLIFY;
 					break;
 				default:
 					generate_exception(EXCEPTION_INVALIDOP);
@@ -620,6 +920,50 @@ void mips1core_device_base::execute_run()
 					m_branch_state = BRANCH;
 					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
 				}
+				break;
+			case 0x14: // R3900 BEQL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (m_r[RSREG] == m_r[RTREG])
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x15: // R3900 BNEL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (m_r[RSREG] != m_r[RTREG])
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x16: // R3900 BLEZL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (s32(m_r[RSREG]) <= 0)
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
+				break;
+			case 0x17: // R3900 BGTZL
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (s32(m_r[RSREG]) > 0)
+				{
+					m_branch_state = BRANCH;
+					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+				}
+				else
+					m_branch_state = NULLIFY;
 				break;
 			case 0x08: // ADDI
 				{
@@ -668,23 +1012,46 @@ void mips1core_device_base::execute_run()
 			case 0x13: // COP3
 				handle_cop3(op);
 				break;
+			case 0x1c: // R3900 MADD/MADDU
+				handle_special2(op);
+				break;
 			case 0x20: // LB
-				load<u8>(SIMMVAL + m_r[RSREG], [this, op](s8 temp) { m_r[RTREG] = temp; });
+				load<u8>(SIMMVAL + m_r[RSREG], [this, op](s8 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x21: // LH
-				load<u16>(SIMMVAL + m_r[RSREG], [this, op](s16 temp) { m_r[RTREG] = temp; });
+				load<u16>(SIMMVAL + m_r[RSREG], [this, op](s16 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x22: // LWL
 				lwl(op);
 				break;
 			case 0x23: // LW
-				load<u32>(SIMMVAL + m_r[RSREG], [this, op](u32 temp) { m_r[RTREG] = temp; });
+				load<u32>(SIMMVAL + m_r[RSREG], [this, op](u32 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x24: // LBU
-				load<u8>(SIMMVAL + m_r[RSREG], [this, op](u8 temp) { m_r[RTREG] = temp; });
+				load<u8>(SIMMVAL + m_r[RSREG], [this, op](u8 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x25: // LHU
-				load<u16>(SIMMVAL + m_r[RSREG], [this, op](u16 temp) { m_r[RTREG] = temp; });
+				load<u16>(SIMMVAL + m_r[RSREG], [this, op](u16 temp)
+				{
+					m_r[RTREG] = temp;
+					set_gpr_delay(RTREG);
+				});
 				break;
 			case 0x26: // LWR
 				lwr(op);
@@ -703,6 +1070,27 @@ void mips1core_device_base::execute_run()
 				break;
 			case 0x2e: // SWR
 				swr(op);
+				break;
+			case 0x2f: // CACHE
+				// CACHE is a CP0 operation on the R3900.  Kernel mode may
+				// always use CP0, but user mode requires Status.CU0.
+				if (!m_multiply_to_gpr)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else if (!(SR & SR_KUc) || (SR & SR_COP0))
+					handle_cache(op);
+				else
+					generate_exception(EXCEPTION_BADCOP0);
+				break;
+			case 0x30: // R3900 reserved LWC0
+			case 0x38: // R3900 reserved SWC0
+				// Coprocessor Unusable has priority over Reserved
+				// Instruction when user mode has disabled CP0.
+				if (m_multiply_to_gpr
+						&& (SR & SR_KUc)
+						&& !(SR & SR_COP0))
+					generate_exception(EXCEPTION_BADCOP0);
+				else
+					generate_exception(EXCEPTION_INVALIDOP);
 				break;
 			case 0x31: // LWC1
 				handle_cop1(op);
@@ -729,9 +1117,29 @@ void mips1core_device_base::execute_run()
 
 			// clear register 0
 			m_r[0] = 0;
-		});
+			});
+
+			// DERET suppresses an ordinary single step at its return
+			// destination, but a destination that cannot be fetched has no
+			// instruction to suppress.  Preserve the permitted DSS+AdEL
+			// coincidence in that case as well.
+			if (m_multiply_to_gpr
+					&& debug_step_suppressed
+					&& (m_cop0[COP0_Debug] & DEBUG_SST)
+					&& !(m_cop0[COP0_Debug] & DEBUG_DM)
+					&& !instruction_fetched
+					&& (m_branch_state == EXCEPTION)
+					&& ((CAUSE & CAUSE_EXCCODE) == EXCEPTION_ADDRLOAD))
+			{
+				m_pc = fetch_pc;
+				m_branch_state = fetch_branch_state;
+				generate_debug_exception(DEBUG_DSS | DEBUG_OES);
+			}
+		}
 
 		// update pc and branch state
+		bool const complete_deret =
+				deret_delay && (m_branch_state == DELAY);
 		switch (m_branch_state)
 		{
 		case NONE:
@@ -748,17 +1156,63 @@ void mips1core_device_base::execute_run()
 			m_pc += 4;
 			break;
 
+		case NULLIFY:
+			m_branch_state = NONE;
+			m_pc += 8;
+			break;
+
 		case EXCEPTION:
 			m_branch_state = NONE;
 			break;
 		}
+
+		// DERET suppresses single-step at its return destination and, when
+		// that instruction branches, through its delay slot as well.
+		if (debug_step_suppressed)
+			m_debug_step_suppress = m_branch_state == DELAY;
+
+		// DERET's mode changes occur with its delayed transfer, after the
+		// instruction in the debug handler's delay slot has executed.
+		if (complete_deret)
+		{
+			m_deret_pending = false;
+			m_cop0[COP0_Debug] &= ~DEBUG_DM;
+			bool const was_user = bool(SR & SR_KUc);
+			SR |= SR_KUc | SR_IEc;
+			if (!was_user)
+				debugger_privilege_hook();
+			m_debug_step_suppress = true;
+		}
+
+		// The R3900 divider runs beside the integer pipeline.  Account for
+		// every elapsed core cycle, including another pipeline interlock, but
+		// only the issue cycle when this instruction started a new divide.
+		advance_divide(
+				divide_started
+						? 1U
+						: 1U + unsigned(cycle_start - m_icount));
 	}
 }
 
 void mips1core_device_base::execute_set_input(int irqline, int state)
 {
+	if (irqline == INPUT_LINE_NMI)
+	{
+		bool const asserted = state != CLEAR_LINE;
+		if (m_multiply_to_gpr && asserted && !m_nmi_line)
+			m_nmi_pending = true;
+		if (m_multiply_to_gpr && asserted)
+			m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
+		m_nmi_line = asserted;
+		return;
+	}
+
 	if (state != CLEAR_LINE)
+	{
 		CAUSE |= CAUSE_IPEX0 << irqline;
+		if (m_multiply_to_gpr)
+			m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
+	}
 	else
 		CAUSE &= ~(CAUSE_IPEX0 << irqline);
 }
@@ -817,13 +1271,499 @@ mips1core_device_base::translate_result mips1core_device_base::translate(int int
 	return m_cache;
 }
 
+mips1core_device_base::translate_result r3900_device::translate(int intention, offs_t &address, bool debug)
+{
+	// The R3900 has no TLB.  Kuseg is offset by 1 GiB, kseg0/kseg1 map
+	// through physical segment zero, and kseg2 is direct-mapped.  The top
+	// 16 MiB of kuseg and kseg2 are uncached windows.
+	offs_t const virtual_address = address;
+	translate_result result =
+			mips1core_device_base::translate(intention, address, debug);
+	if (result == CACHED
+			&& (virtual_address & 0x7f00'0000) == 0x7f00'0000)
+		result = UNCACHED;
+
+	// Disabled caches behave like uncached accesses: every access misses and
+	// no refill takes place.  Instruction and data enables are independent.
+	if (result == CACHED
+			&& !BIT(m_cop0[COP0_Config], intention == TR_FETCH ? 5 : 4))
+		return UNCACHED;
+
+	return result;
+}
+
+void r3900_device::exception_enter()
+{
+	// DALc/IALc and DALp/IALp form the same three-level exception stack as
+	// the Status register's current/previous/old mode bits.
+	u32 const modes = m_cop0[COP0_Cache];
+	m_cop0[COP0_Cache] =
+			(modes & ~0x0000'3f00) | ((modes << 2) & 0x0000'3c00);
+}
+
+void r3900_device::handle_rfe()
+{
+	// R3900 RFE leaves the old Status and Cache modes intact while copying
+	// old to previous and previous to current.
+	SR = (SR & ~0x0000'000f) | ((SR >> 2) & 0x0000'000f);
+	if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
+		debugger_privilege_hook();
+
+	u32 const modes = m_cop0[COP0_Cache];
+	m_cop0[COP0_Cache] =
+			(modes & ~0x0000'0f00) | ((modes >> 2) & 0x0000'0f00);
+}
+
+u32 r3900_device::get_cop0_reg(unsigned const reg)
+{
+	switch (reg)
+	{
+	case COP0_Config:
+	case COP0_Cache:
+	case COP0_Debug:
+	case COP0_DEPC:
+		return m_cop0[reg];
+
+	default:
+		return mips1core_device_base::get_cop0_reg(reg);
+	}
+}
+
+void r3900_device::set_cop0_reg(unsigned const reg, u32 const data)
+{
+	switch (reg)
+	{
+	case COP0_Config:
+		// ICS/DCS are read-only implementation sizes.  Reserved bits read
+		// zero, and setting Lock prevents all writes until reset.
+		if (!BIT(m_cop0[COP0_Config], 7))
+		{
+			m_cop0[COP0_Config] =
+					(m_cop0[COP0_Config] & 0x003f'0000)
+					| (data & 0x0000'0fff);
+			if ((CAUSE & CAUSE_IPEX)
+					|| m_nmi_line
+					|| m_nmi_pending)
+				m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
+			// RF selects the processor clock divided by 1, 2, 4, or 8.
+			// External devices retain their independently configured clocks.
+			set_clock_scale(
+					1.0 / double(1U << BIT(m_cop0[COP0_Config], 10, 2)));
+		}
+		break;
+
+	case COP0_Cache:
+		// Only the six current/previous/old I/D auto-lock mode bits exist.
+		m_cop0[COP0_Cache] = data & 0x0000'3f00;
+		break;
+
+	case COP0_Status:
+		// Bits 19:16 and the other inherited R3000 cache controls are
+		// reserved.  TS is read-only one because the R3900 has no TLB, while
+		// NmI is a write-one-to-clear status latch.
+		mips1core_device_base::set_cop0_reg(
+				reg,
+				(data & (SR_COP3 | SR_COP2 | SR_COP1 | SR_COP0
+						| SR_RE | SR_BEV | SR_IM | SR_KUIE))
+						| SR_TS
+						| ((data & SR_NMI) ? 0 : (SR & SR_NMI)));
+		break;
+
+	case COP0_Debug:
+		// SSt and BsF are the only software-writable Debug fields.
+		m_cop0[COP0_Debug] =
+				(m_cop0[COP0_Debug] & ~(DEBUG_BSF | DEBUG_SST))
+				| (data & (DEBUG_BSF | DEBUG_SST));
+		break;
+
+	case COP0_DEPC:
+		m_cop0[COP0_DEPC] = data;
+		break;
+
+	default:
+		mips1core_device_base::set_cop0_reg(reg, data);
+		break;
+	}
+}
+
+bool r3900_device::cache_auto_lock(bool icache) const
+{
+	// Debug mode forces cache auto-lock off.  The implemented TX39
+	// configuration reserves instruction auto-lock.
+	return !(m_cop0[COP0_Debug] & DEBUG_DM)
+			&& !icache
+			&& BIT(m_cop0[COP0_Cache], 8);
+}
+
+unsigned r3900_device::cache_refill_words(bool icache) const
+{
+	if (icache)
+		return 4U << BIT(m_cop0[COP0_Config], 2, 2);
+
+	// DCBR clear selects the data cache's native one-word line. Otherwise
+	// DRSize encodes 4, 8, 16, or 32 words.
+	return BIT(m_cop0[COP0_Config], 6)
+			? 4U << BIT(m_cop0[COP0_Config], 0, 2)
+			: 1U;
+}
+
+void r3900_device::invalidate_data_cache(u32 address, u32 bytes)
+{
+	// Doze permits external cache snooping, while Halt explicitly does not.
+	if (!bytes || (m_cop0[COP0_Config] & CONFIG_HALT))
+		return;
+
+	// Dino DMA uses physical addresses while the R3900 can cache the same
+	// memory through its direct-mapped low-address segment.  Invalidate every
+	// resident word touched by the external write so the next CPU load refills
+	// it from memory.  Keep locked lines intact: DALc turns a way into on-chip
+	// scratch storage rather than ordinary coherent memory.
+	u64 const end = u64(address) + bytes;
+	for (u64 current = address & ~u32(3); current < end; current += 4)
+	{
+		u32 const word = u32(current);
+		unsigned const index = m_dcache.index(word);
+		for (unsigned way = 0; way < m_dcache.ways; ++way)
+		{
+			struct cache::line &line = m_dcache.at(index, way);
+			if (!line.locked
+					&& !((line.tag ^ word)
+							& (-m_dcache.way_size() | cache::line::INV)))
+				line.invalidate();
+		}
+	}
+}
+
+bool mips1core_device_base::reads_gpr(u32 const op, unsigned const reg) const
+{
+	if (!reg)
+		return false;
+
+	unsigned const rs = BIT(op, 21, 5);
+	unsigned const rt = BIT(op, 16, 5);
+	auto const reads_rs = [reg, rs]() { return rs == reg; };
+	auto const reads_rt = [reg, rt]() { return rt == reg; };
+
+	switch (op >> 26)
+	{
+	case 0x00: // SPECIAL
+		switch (op & 63)
+		{
+		case 0x00: // SLL
+		case 0x02: // SRL
+		case 0x03: // SRA
+			return reads_rt();
+
+		case 0x04: // SLLV
+		case 0x06: // SRLV
+		case 0x07: // SRAV
+		case 0x18: // MULT
+		case 0x19: // MULTU
+		case 0x1a: // DIV
+		case 0x1b: // DIVU
+		case 0x20: // ADD
+		case 0x21: // ADDU
+		case 0x22: // SUB
+		case 0x23: // SUBU
+		case 0x24: // AND
+		case 0x25: // OR
+		case 0x26: // XOR
+		case 0x27: // NOR
+		case 0x2a: // SLT
+		case 0x2b: // SLTU
+			return reads_rs() || reads_rt();
+
+		case 0x08: // JR
+		case 0x09: // JALR
+		case 0x11: // MTHI
+		case 0x13: // MTLO
+			return reads_rs();
+
+		default:
+			return false;
+		}
+
+	case 0x01: // REGIMM
+	case 0x06: // BLEZ
+	case 0x07: // BGTZ
+	case 0x08: // ADDI
+	case 0x09: // ADDIU
+	case 0x0a: // SLTI
+	case 0x0b: // SLTIU
+	case 0x0c: // ANDI
+	case 0x0d: // ORI
+	case 0x0e: // XORI
+		return reads_rs();
+
+	case 0x04: // BEQ
+	case 0x05: // BNE
+	case 0x14: // R3900 BEQL
+	case 0x15: // R3900 BNEL
+	case 0x1c: // R3900 MADD/MADDU
+		return reads_rs() || reads_rt();
+
+	case 0x16: // R3900 BLEZL
+	case 0x17: // R3900 BGTZL
+		return reads_rs();
+
+	case 0x10: // COP0
+	case 0x11: // COP1
+	case 0x12: // COP2
+	case 0x13: // COP3
+		// Move/control-to-coprocessor instructions source a GPR in rt.
+		return (rs == 0x04 || rs == 0x06) && reads_rt();
+
+	case 0x20: // LB
+	case 0x21: // LH
+	case 0x22: // LWL
+	case 0x23: // LW
+	case 0x24: // LBU
+	case 0x25: // LHU
+	case 0x26: // LWR
+	case 0x2f: // CACHE
+	case 0x31: // LWC1
+	case 0x32: // LWC2
+	case 0x33: // LWC3
+	case 0x39: // SWC1
+	case 0x3a: // SWC2
+	case 0x3b: // SWC3
+		return reads_rs();
+
+	case 0x28: // SB
+	case 0x29: // SH
+	case 0x2a: // SWL
+	case 0x2b: // SW
+	case 0x2e: // SWR
+		return reads_rs() || reads_rt();
+
+	default:
+		return false;
+	}
+}
+
+void mips1core_device_base::gpr_interlock(u32 const op)
+{
+	if (m_gpr_delay && reads_gpr(op, m_gpr_delay))
+		m_icount--;
+
+	m_gpr_delay = 0;
+}
+
+void mips1core_device_base::set_gpr_delay(unsigned const reg)
+{
+	if (m_multiply_to_gpr)
+		m_gpr_delay = reg;
+}
+
+void mips1core_device_base::cancel_divide()
+{
+	if (m_multiply_to_gpr)
+		m_divide_cycles = 0;
+}
+
+void mips1core_device_base::divide_interlock()
+{
+	if (!m_divide_cycles)
+		return;
+
+	m_icount -= m_divide_cycles;
+	m_hi = m_divide_hi;
+	m_lo = m_divide_lo;
+	m_divide_cycles = 0;
+}
+
+void mips1core_device_base::advance_divide(unsigned const cycles)
+{
+	if (!m_divide_cycles)
+		return;
+
+	if (cycles < m_divide_cycles)
+	{
+		m_divide_cycles -= cycles;
+		return;
+	}
+
+	m_hi = m_divide_hi;
+	m_lo = m_divide_lo;
+	m_divide_cycles = 0;
+}
+
+bool r3900_device::cache_store_allocate() const
+{
+	// The R3900 data cache is write-through without write allocation.
+	return false;
+}
+
+void r3900_device::handle_cache(u32 const op)
+{
+	offs_t address = m_r[RSREG] + SIMMVAL;
+
+	switch (RTREG)
+	{
+	case 0x00: // instruction cache index invalidate
+		if (!BIT(m_cop0[COP0_Config], 5))
+		{
+			// One instruction-cache tag covers four words.
+			address &= ~0x0f;
+			for (unsigned word = 0; word < 4; ++word)
+				std::get<0>(
+						cache_lookup(address + word * 4, false, true))
+						.invalidate();
+		}
+		break;
+
+	case 0x05: // data cache index LRU bit clear
+		m_dcache.lru[m_dcache.index(address)] = 0;
+		break;
+
+	case 0x09: // data cache index lock bit clear
+		for (unsigned way = 0; way < m_dcache.ways; ++way)
+			m_dcache.at(m_dcache.index(address), way).locked = 0;
+		break;
+
+	case 0x11: // data cache hit invalidate
+		if (translate(TR_READ, address, false) == CACHED)
+		{
+			auto [line, miss] = cache_lookup(address, false);
+			if (!miss)
+			{
+				line.invalidate();
+				if (!line.locked)
+				{
+					unsigned const index = m_dcache.index(address);
+					for (unsigned way = 0; way < m_dcache.ways; ++way)
+					{
+						if (&m_dcache.at(index, way) == &line)
+						{
+							m_dcache.lru[index] = way;
+							break;
+						}
+					}
+				}
+			}
+		}
+		break;
+
+	default:
+		generate_exception(EXCEPTION_INVALIDOP);
+		break;
+	}
+}
+
+void mips1core_device_base::handle_special2(u32 const op)
+{
+	generate_exception(EXCEPTION_INVALIDOP);
+}
+
+void r3900_device::handle_special2(u32 const op)
+{
+	if (BIT(op, 6, 5))
+	{
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	u64 product;
+
+	switch (op & 63)
+	{
+	case 0x00: // MADD
+		product = mul_32x32(m_r[RSREG], m_r[RTREG]);
+		break;
+
+	case 0x01: // MADDU
+		product = mulu_32x32(m_r[RSREG], m_r[RTREG]);
+		break;
+
+	default:
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	// MADD and MADDU read HI:LO, so they interlock only while an independent
+	// divide is still producing that accumulator.
+	divide_interlock();
+
+	u64 const accumulator = (u64(m_hi) << 32) | m_lo;
+	u64 const result = accumulator + product;
+	m_lo = u32(result);
+	m_hi = u32(result >> 32);
+	m_r[RDREG] = m_lo;
+
+	set_gpr_delay(RDREG);
+}
+
 std::unique_ptr<util::disasm_interface> mips1core_device_base::create_disassembler()
 {
-	return std::make_unique<mips1_disassembler>();
+	return std::make_unique<mips1_disassembler>(m_multiply_to_gpr);
+}
+
+void mips1core_device_base::generate_debug_exception(u32 const cause)
+{
+	// Debug exceptions use their own state and vector.  Ordinary Status,
+	// Cause and EPC state is deliberately left untouched.
+	m_gpr_delay = 0;
+	m_deret_pending = false;
+	m_cop0[COP0_DEPC] = m_pc;
+
+	u32 debug = m_cop0[COP0_Debug] & (DEBUG_BSF | DEBUG_SST);
+	if (m_branch_state == DELAY)
+	{
+		m_cop0[COP0_DEPC] -= 4;
+		debug |= DEBUG_DBD;
+	}
+
+	m_cop0[COP0_Debug] = debug | DEBUG_DM | cause;
+	m_branch_state = EXCEPTION;
+	m_pc = 0xbfc0'0200;
+}
+
+void mips1core_device_base::generate_nmi_exception()
+{
+	// R3900 NMI retains the ordinary mode stacks but records the interrupted
+	// boundary, sets the write-one-to-clear status latch, and enters the
+	// fixed uncached reset/NMI vector.
+	m_nmi_pending = false;
+	m_gpr_delay = 0;
+	m_deret_pending = false;
+	m_cop0[COP0_EPC] = m_pc;
+	CAUSE &= ~CAUSE_BD;
+	if (m_branch_state == DELAY)
+	{
+		m_cop0[COP0_EPC] -= 4;
+		CAUSE |= CAUSE_BD;
+	}
+	m_branch_state = EXCEPTION;
+	SR |= SR_NMI;
+	m_cop0[COP0_Config] &= ~CONFIG_POWER_DOWN;
+	m_pc = 0xbfc0'0000;
+}
+
+bool mips1core_device_base::handle_bus_error(bool const instruction)
+{
+	if (!m_bus_error)
+		return false;
+
+	m_bus_error = false;
+	if (m_multiply_to_gpr
+			&& !instruction
+			&& (m_cop0[COP0_Debug] & DEBUG_DM))
+		m_cop0[COP0_Debug] |= DEBUG_BSF;
+	else
+		generate_exception(
+				instruction ? EXCEPTION_BUSINST : EXCEPTION_BUSDATA);
+
+	return true;
 }
 
 void mips1core_device_base::generate_exception(u32 exception, bool refill)
 {
+	// An exception flushes the integer pipeline.  A TX39 divide continues in
+	// its independent unit, but a one-cycle GPR dependency does not carry into
+	// the exception handler.
+	m_gpr_delay = 0;
+	m_deret_pending = false;
+
 	// set the exception PC
 	m_cop0[COP0_EPC] = m_pc;
 
@@ -846,11 +1786,17 @@ void mips1core_device_base::generate_exception(u32 exception, bool refill)
 	// hook exception in caller context enabling debugger access to memory parameters
 	debugger_exception_hook(exception);
 
+	exception_enter();
+
 	// shift the exception bits
 	SR = (SR & ~SR_KUIE) | ((SR << 2) & SR_KUIEop);
 
 	if (SR & SR_KUp)
 		debugger_privilege_hook();
+}
+
+void mips1core_device_base::exception_enter()
+{
 }
 
 void mips1core_device_base::address_error(int intention, u32 const address)
@@ -879,34 +1825,38 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		set_cop0_reg(RDREG, m_r[RTREG]);
 		break;
 	case 0x08: // BC0
-		switch (RTREG)
-		{
-		case 0x00: // BC0F
-			if (!m_in_brcond[0]())
-			{
-				m_branch_state = BRANCH;
-				m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-			}
-			break;
-		case 0x01: // BC0T
-			if (m_in_brcond[0]())
-			{
-				m_branch_state = BRANCH;
-				m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-			}
-			break;
-		default:
-			generate_exception(EXCEPTION_INVALIDOP);
-			break;
-		}
+		handle_cop_branch(0, op);
 		break;
 	case 0x10: // COP0
 		switch (op & 31)
 		{
+			case 0x01: // R3900 TLBR
+			case 0x02: // R3900 TLBWI
+			case 0x06: // R3900 TLBWR
+			case 0x08: // R3900 TLBP
+				// The R3900 has no TLB and explicitly treats these exact
+				// inherited R3000A encodings as no-ops.
+				if (!m_multiply_to_gpr
+						|| op != (0x4200'0000 | (op & 31)))
+					generate_exception(EXCEPTION_INVALIDOP);
+				break;
 			case 0x10: // RFE
-				SR = (SR & ~SR_KUIE) | ((SR >> 2) & SR_KUIEpc);
-				if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
-					debugger_privilege_hook();
+				if (m_multiply_to_gpr && op != 0x4200'0010)
+					generate_exception(EXCEPTION_INVALIDOP);
+				else
+					handle_rfe();
+				break;
+			case 0x1f: // R3900 DERET
+				if (m_multiply_to_gpr
+						&& op == 0x4200'001f
+						&& (m_cop0[COP0_Debug] & DEBUG_DM))
+				{
+					m_branch_target = m_cop0[COP0_DEPC];
+					m_branch_state = BRANCH;
+					m_deret_pending = true;
+				}
+				else
+					generate_exception(EXCEPTION_INVALIDOP);
 				break;
 			default:
 				generate_exception(EXCEPTION_INVALIDOP);
@@ -917,6 +1867,13 @@ void mips1core_device_base::handle_cop0(u32 const op)
 		generate_exception(EXCEPTION_INVALIDOP);
 		break;
 	}
+}
+
+void mips1core_device_base::handle_rfe()
+{
+	SR = (SR & ~SR_KUIE) | ((SR >> 2) & SR_KUIEpc);
+	if (bool(SR & SR_KUc) ^ bool(SR & SR_KUp))
+		debugger_privilege_hook();
 }
 
 u32 mips1core_device_base::get_cop0_reg(unsigned const reg)
@@ -960,6 +1917,48 @@ void mips1core_device_base::handle_cop1(u32 const op)
 {
 	if (!(SR & SR_COP1))
 		generate_exception(EXCEPTION_BADCOP1);
+	else if ((op >> 26) == 0x11 && RSREG == 0x08) // BC1
+		handle_cop_branch(1, op);
+	else
+		generate_exception(EXCEPTION_INVALIDOP);
+}
+
+void mips1core_device_base::handle_cop_branch(unsigned const cop, u32 const op)
+{
+	if (RTREG > (m_multiply_to_gpr ? 0x03 : 0x01))
+	{
+		generate_exception(EXCEPTION_INVALIDOP);
+		return;
+	}
+
+	bool const taken = bool(m_in_brcond[cop]()) == bool(RTREG & 1);
+	if (taken)
+	{
+		m_branch_state = BRANCH;
+		m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
+	}
+	else if (BIT(RTREG, 1)) // R3900 BCzFL/BCzTL
+		m_branch_state = NULLIFY;
+}
+
+void mips1core_device_base::handle_cache(u32 const)
+{
+	generate_exception(EXCEPTION_INVALIDOP);
+}
+
+bool mips1core_device_base::cache_auto_lock(bool icache) const
+{
+	return false;
+}
+
+unsigned mips1core_device_base::cache_refill_words(bool icache) const
+{
+	return 1;
+}
+
+bool mips1core_device_base::cache_store_allocate() const
+{
+	return true;
 }
 
 void mips1core_device_base::handle_cop2(u32 const op)
@@ -969,26 +1968,7 @@ void mips1core_device_base::handle_cop2(u32 const op)
 		switch (RSREG)
 		{
 		case 0x08: // BC2
-			switch (RTREG)
-			{
-			case 0x00: // BC2F
-				if (!m_in_brcond[2]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			case 0x01: // BC2T
-				if (m_in_brcond[2]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			default:
-				generate_exception(EXCEPTION_INVALIDOP);
-				break;
-			}
+			handle_cop_branch(2, op);
 			break;
 		default:
 			generate_exception(EXCEPTION_INVALIDOP);
@@ -1006,26 +1986,7 @@ void mips1core_device_base::handle_cop3(u32 const op)
 		switch (RSREG)
 		{
 		case 0x08: // BC3
-			switch (RTREG)
-			{
-			case 0x00: // BC3F
-				if (!m_in_brcond[3]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			case 0x01: // BC3T
-				if (m_in_brcond[3]())
-				{
-					m_branch_state = BRANCH;
-					m_branch_target = m_pc + 4 + (s32(SIMMVAL) << 2);
-				}
-				break;
-			default:
-				generate_exception(EXCEPTION_INVALIDOP);
-				break;
-			}
+			handle_cop_branch(3, op);
 			break;
 		default:
 			generate_exception(EXCEPTION_INVALIDOP);
@@ -1041,9 +2002,10 @@ void mips1core_device_base::lwl(u32 const op)
 	offs_t const offset = SIMMVAL + m_r[RSREG];
 	load<u32, false>(offset, [this, op, offset](u32 temp)
 	{
-		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 3 : 0)) << 3;
+		unsigned const shift = ((offset & 3) ^ (big_endian() ? 0 : 3)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU << shift)) | (temp << shift);
+		set_gpr_delay(RTREG);
 	});
 }
 
@@ -1052,16 +2014,17 @@ void mips1core_device_base::lwr(u32 const op)
 	offs_t const offset = SIMMVAL + m_r[RSREG];
 	load<u32, false>(offset, [this, op, offset](u32 temp)
 	{
-		unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 0 : 3)) << 3;
+		unsigned const shift = ((offset & 3) ^ (big_endian() ? 3 : 0)) << 3;
 
 		m_r[RTREG] = (m_r[RTREG] & ~u32(0xffffffffU >> shift)) | (temp >> shift);
+		set_gpr_delay(RTREG);
 	});
 }
 
 void mips1core_device_base::swl(u32 const op)
 {
 	offs_t const offset = SIMMVAL + m_r[RSREG];
-	unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 3 : 0)) << 3;
+	unsigned const shift = ((offset & 3) ^ (big_endian() ? 0 : 3)) << 3;
 
 	store<u32, false>(offset, m_r[RTREG] >> shift, 0xffffffffU >> shift);
 }
@@ -1069,24 +2032,25 @@ void mips1core_device_base::swl(u32 const op)
 void mips1core_device_base::swr(u32 const op)
 {
 	offs_t const offset = SIMMVAL + m_r[RSREG];
-	unsigned const shift = ((offset & 3) ^ (m_endianness == ENDIANNESS_LITTLE ? 0 : 3)) << 3;
+	unsigned const shift = ((offset & 3) ^ (big_endian() ? 3 : 0)) << 3;
 
 	store<u32, false>(offset, m_r[RTREG] << shift, 0xffffffffU << shift);
 }
 
 /*
  * This function determines the active cache (instruction or data) depending on
- * the icache parameter and the status register SwC (swap caches) flag. A line
- * within the cache is then selected based upon the low address bits. The upper
- * address bits are compared with the line tag to identify whether the lookup
- * is a hit or a miss.
+ * the icache parameter and the status register SwC (swap caches) flag. A set
+ * within the cache is selected based upon the low address bits, and every way
+ * is compared with the upper address tag.
  *
- * If the cache lookup misses and the invalidate parameter evaluates to true,
- * the cache line tag is updated to match the input address and invalidated.
+ * A miss selects an invalid unlocked way before the LRU way. If the cache
+ * lookup misses and the invalidate parameter evaluates to true, the selected
+ * cache line tag is updated to match the input address and invalidated.
  *
  * The function returns the selected line and the miss state.
  *
- * TODO: multiple-word cache lines
+ * Cache backing remains word-granular. Devices may refill several consecutive
+ * words for one miss while retaining this per-word lookup and tag model.
  */
 std::tuple<struct mips1core_device_base::cache::line &, bool> mips1core_device_base::cache_lookup(u32 address, bool invalidate, bool icache)
 {
@@ -1094,23 +2058,155 @@ std::tuple<struct mips1core_device_base::cache::line &, bool> mips1core_device_b
 	address &= ~3;
 
 	// select instruction or data cache
-	struct cache const &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
+	struct cache &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
+	unsigned const index = c.index(address);
 
-	// select line within cache based on low address bits
-	struct cache::line &l = c.line[(address & (c.size - 1)) >> 2];
+	// Clear cache parity error on baseline MIPS-I devices.  The R3900
+	// reassigns this Status bit to its write-one-to-clear NmI latch.
+	if (!m_multiply_to_gpr)
+		SR &= ~SR_PE;
 
-	// clear cache parity error
-	SR &= ~SR_PE;
+	// Compare every way before selecting a replacement.
+	unsigned selected = c.lru[index];
+	bool miss = true;
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
+		struct cache::line &candidate = c.at(index, way);
+		if (!((candidate.tag ^ address)
+					& (-c.way_size() | cache::line::INV)))
+		{
+			selected = way;
+			miss = false;
+			break;
+		}
+	}
 
-	// compare cache line tag against upper address bits and line valid bit
-	bool const miss = (l.tag ^ address) & (-c.size | cache::line::INV);
+	// Prefer an invalid, unlocked way. A locked index can replace only its
+	// unlocked way, independent of the ordinary LRU selector.
+	if (miss)
+	{
+		for (unsigned way = 0; way < c.ways; ++way)
+		{
+			if (!c.at(index, way).locked
+					&& (c.at(index, way).tag & cache::line::INV))
+			{
+				selected = way;
+				break;
+			}
+		}
+		for (unsigned way = 0; c.ways > 1 && way < c.ways; ++way)
+		{
+			if (c.at(index, way).locked)
+				selected = way ^ 1;
+		}
+	}
 
-	// on cache miss, optionally update the line tag and invalidate (cache
-	// miss is usually followed by line replacement)
+	struct cache::line &l = c.at(index, selected);
+
+	// A miss is usually followed by line replacement.
 	if (miss && invalidate)
-		l.tag = (address & -c.size) | cache::line::INV;
+	{
+		l.tag = (address & -c.way_size()) | cache::line::INV;
+		l.locked = 0;
+	}
+
+	if (c.ways > 1 && (!miss || invalidate))
+	{
+		// While one way is locked the replacement selector must continue to
+		// name the other way. Otherwise the accessed way becomes most recent.
+		bool locked = false;
+		for (unsigned way = 0; way < c.ways; ++way)
+		{
+			if (c.at(index, way).locked)
+			{
+				c.lru[index] = way ^ 1;
+				locked = true;
+			}
+		}
+		if (!locked)
+			c.lru[index] = selected ^ 1;
+	}
 
 	return std::tie(l, miss);
+}
+
+void mips1core_device_base::cache_lock(u32 address, bool icache)
+{
+	if (!cache_auto_lock(icache))
+		return;
+
+	address &= ~3;
+	struct cache &c = (icache ^ bool(SR & SR_SwC)) ? m_icache : m_dcache;
+	if (c.ways < 2)
+		return;
+	unsigned const index = c.index(address);
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
+		if (c.at(index, way).locked)
+		{
+			c.lru[index] = way ^ 1;
+			return;
+		}
+	}
+	for (unsigned way = 0; way < c.ways; ++way)
+	{
+		struct cache::line &candidate = c.at(index, way);
+		if (!((candidate.tag ^ address)
+					& (-c.way_size() | cache::line::INV)))
+		{
+			candidate.locked = 1;
+			if (c.ways > 1)
+				c.lru[index] = way ^ 1;
+			break;
+		}
+	}
+}
+
+bool mips1core_device_base::cache_refill(u32 address, bool icache)
+{
+	unsigned const words = cache_refill_words(icache);
+	u32 const start = address & ~(words * 4 - 1);
+
+	for (unsigned word = 0; word < words; ++word)
+	{
+		u32 const refill_address = start + word * 4;
+		struct cache::line &line =
+				std::get<0>(cache_lookup(refill_address, true, icache));
+		u32 const data = space(AS_PROGRAM).read_dword(refill_address);
+		if (handle_bus_error(icache))
+		{
+			// An R3900 instruction tag covers four words.  If any transfer
+			// in that block fails, none of the block may remain valid; blocks
+			// completed earlier in a longer refill remain usable.
+			if (m_multiply_to_gpr && icache)
+			{
+				u32 const block = refill_address & ~0x0f;
+				for (unsigned block_word = 0; block_word < 4; ++block_word)
+				{
+					auto [block_line, block_miss] =
+							cache_lookup(block + block_word * 4, false, true);
+					if (!block_miss)
+						block_line.invalidate();
+				}
+			}
+			return false;
+		}
+
+		line.update(data);
+		cache_lock(refill_address, icache);
+	}
+
+	return true;
+}
+
+bool mips1core_device_base::reverse_endian() const
+{
+	return (SR & SR_RE) && (SR & SR_KUc);
+}
+
+bool mips1core_device_base::big_endian() const
+{
+	return (m_endianness == ENDIANNESS_BIG) != reverse_endian();
 }
 
 // compute bit position of sub-unit within a word given endianness and address
@@ -1118,11 +2214,22 @@ template <typename T>
 unsigned mips1core_device_base::shift_factor(u32 address) const
 {
 	if constexpr (sizeof(T) == 1)
-		return ((m_endianness == ENDIANNESS_BIG) ? (address & 3) ^ 3 : (address & 3)) * 8;
+		return (big_endian() ? (address & 3) ^ 3 : (address & 3)) * 8;
 	else if constexpr (sizeof(T) == 2)
-		return ((m_endianness == ENDIANNESS_BIG) ? (address & 2) ^ 2 : (address & 2)) * 8;
+		return (big_endian() ? (address & 2) ^ 2 : (address & 2)) * 8;
 	else
 		return 0;
+}
+
+// Reverse-endian user accesses select the opposite byte or halfword lane on
+// the fixed-endian memory interface.  Aligned words retain their bit numbering.
+template <typename T>
+offs_t mips1core_device_base::bus_address(offs_t address) const
+{
+	if constexpr (sizeof(T) < 4)
+		return reverse_endian() ? address ^ (4 - sizeof(T)) : address;
+	else
+		return address;
 }
 
 template <typename T, bool Aligned, typename U>
@@ -1152,38 +2259,24 @@ std::enable_if_t<std::is_convertible<U, std::function<void(T)>>::value, void> mi
 
 			if (miss)
 			{
-				// load
-				u32 const data = space(AS_PROGRAM).read_dword(address);
-				if (m_bus_error)
-				{
-					m_bus_error = false;
-					generate_exception(EXCEPTION_BUSDATA);
-
+				if (!cache_refill(address, false))
 					return;
-				}
-
-				// replace cache line data and mark valid
-				l.update(data);
 			}
 
 			data = l.data >> shift_factor<T>(address);
+			cache_lock(address);
 		}
 		else
 		{
 			if constexpr (sizeof(T) == 4)
 				data = space(AS_PROGRAM).read_dword(address);
 			else if constexpr (sizeof(T) == 2)
-				data = space(AS_PROGRAM).read_word(address);
+				data = space(AS_PROGRAM).read_word(bus_address<T>(address));
 			else if constexpr (sizeof(T) == 1)
-				data = space(AS_PROGRAM).read_byte(address);
+				data = space(AS_PROGRAM).read_byte(bus_address<T>(address));
 
-			if (m_bus_error)
-			{
-				m_bus_error = false;
-				generate_exception(EXCEPTION_BUSDATA);
-
+			if (handle_bus_error(false))
 				return;
-			}
 		}
 	}
 	else
@@ -1218,6 +2311,7 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 		translate_result const t = translate(TR_WRITE, address, false);
 		if (t == ERROR)
 			return;
+		bool write_memory = true;
 
 		// align address for sd[lr] instructions
 		if (!Aligned)
@@ -1225,24 +2319,29 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 
 		if (t == CACHED)
 		{
-			auto [l, miss] = cache_lookup(address, sizeof(T) == 4);
+			auto [l, miss] = cache_lookup(
+					address,
+					sizeof(T) == 4 && cache_store_allocate());
 
-			// cached full word stores always update the cache
+			// Most MIPS-I caches allocate a full-word store miss. The R3900
+			// data cache is explicitly write-through without write allocation.
 			if constexpr (Aligned && sizeof(T) == 4)
-				l.update(data);
+			{
+				if (!miss || cache_store_allocate())
+				{
+					l.update(data);
+					cache_lock(address);
+					write_memory = !l.locked;
+				}
+			}
 			else if (!miss)
 			{
 				if (!m_cache_pws)
 				{
 					// reload the cache line from memory
 					u32 const data = space(AS_PROGRAM).read_dword(address);
-					if (m_bus_error)
-					{
-						m_bus_error = false;
-						generate_exception(EXCEPTION_BUSDATA);
-
+					if (handle_bus_error(false))
 						return;
-					}
 
 					l.update(data);
 				}
@@ -1250,16 +2349,26 @@ void mips1core_device_base::store(offs_t address, T data, T mem_mask)
 				// merge data into the cache
 				unsigned const shift = shift_factor<T>(address);
 				l.update(u32(data) << shift, u32(mem_mask) << shift);
+				cache_lock(address);
+				write_memory = !l.locked;
 			}
 		}
 
-		// uncached or write-through store
-		if constexpr (sizeof(T) == 4)
-			space(AS_PROGRAM).write_dword(address, T(data), mem_mask);
-		else if constexpr (sizeof(T) == 2)
-			space(AS_PROGRAM).write_word(address, T(data), mem_mask);
-		else if constexpr (sizeof(T) == 1)
-			space(AS_PROGRAM).write_byte(address, T(data));
+		// Uncached and ordinary cached stores reach memory. A TX39 locked-line
+		// hit updates only the cache until software clears the lock and stores
+		// the value again.
+		if (write_memory)
+		{
+			if constexpr (sizeof(T) == 4)
+				space(AS_PROGRAM).write_dword(address, T(data), mem_mask);
+			else if constexpr (sizeof(T) == 2)
+				space(AS_PROGRAM).write_word(bus_address<T>(address), T(data), mem_mask);
+			else if constexpr (sizeof(T) == 1)
+				space(AS_PROGRAM).write_byte(bus_address<T>(address), T(data));
+
+			if (handle_bus_error(false))
+				return;
+		}
 	}
 	else
 	{
@@ -1278,7 +2387,10 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 {
 	// alignment error
 	if (address & 3)
+	{
 		address_error(TR_FETCH, address);
+		return;
+	}
 
 	translate_result const t = translate(TR_FETCH, address, false);
 	if (t == ERROR)
@@ -1291,18 +2403,8 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 
 		if (miss)
 		{
-			// fetch
-			u32 const data = space(AS_PROGRAM).read_dword(address);
-			if (m_bus_error)
-			{
-				m_bus_error = false;
-				generate_exception(EXCEPTION_BUSINST);
-
+			if (!cache_refill(address, true))
 				return;
-			}
-
-			// replace cache line data and mark valid
-			l.update(data);
 		}
 
 		data = l.data;
@@ -1311,13 +2413,8 @@ void mips1core_device_base::fetch(offs_t address, std::function<void(u32)> &&app
 	{
 		data = space(AS_PROGRAM).read_dword(address);
 
-		if (m_bus_error)
-		{
-			m_bus_error = false;
-			generate_exception(EXCEPTION_BUSINST);
-
+		if (handle_bus_error(true))
 			return;
-		}
 	}
 
 	apply(data);

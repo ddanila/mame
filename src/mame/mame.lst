@@ -43835,6 +43835,12 @@ dash4
 @source:skeleton/datacast.cpp
 datacast
 
+@source:skeleton/datarover.cpp
+datarover840
+datarover840d
+datarover840f
+datarover840j
+
 @source:skeleton/design.cpp
 azkoyent12
 azkoyent6

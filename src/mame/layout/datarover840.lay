@@ -1,0 +1,24 @@
+<?xml version="1.0"?>
+<!--
+license:CC0-1.0
+-->
+<mamelayout version="2">
+	<view name="LCD">
+		<screen tag="screen">
+			<bounds x="0" y="0" width="3" height="2" />
+		</screen>
+	</view>
+	<view name="Serial terminal">
+		<screen tag="terminal:terminal_screen">
+			<bounds x="0" y="0" width="8" height="3" />
+		</screen>
+	</view>
+	<view name="LCD and serial terminal">
+		<screen tag="screen">
+			<bounds x="0" y="0" width="3" height="2" />
+		</screen>
+		<screen tag="terminal:terminal_screen">
+			<bounds x="3" y="0" width="16" height="6" />
+		</screen>
+	</view>
+</mamelayout>

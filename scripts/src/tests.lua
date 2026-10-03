@@ -48,6 +48,7 @@ project("mametests")
 	includedirs {
 		MAME_DIR .. "3rdparty/catch/single_include",
 		MAME_DIR .. "src/osd",
+		MAME_DIR .. "src/devices",
 		MAME_DIR .. "src/emu",
 		MAME_DIR .. "src/lib/util",
 		ext_includedir("expat"),
@@ -55,17 +56,17 @@ project("mametests")
 	}
 
 	files {
-		MAME_DIR .. "src/emu/video/rgbsse.cpp",
-		MAME_DIR .. "src/emu/video/rgbsse.h",
-		MAME_DIR .. "src/emu/video/rgbvmx.cpp",
-		MAME_DIR .. "src/emu/video/rgbvmx.h",
+		MAME_DIR .. "src/emu/video/rgbutil.cpp",
+		MAME_DIR .. "src/emu/video/rgbutil.h",
 	}
 
 	files {
+		MAME_DIR .. "src/devices/cpu/mips/mips1dsm.cpp",
+		MAME_DIR .. "src/devices/cpu/mips/mips1dsm.h",
 		MAME_DIR .. "tests/main.cpp",
+		MAME_DIR .. "tests/devices/cpu/mips/mips1dsm.cpp",
 		MAME_DIR .. "tests/lib/util/corestr.cpp",
 		MAME_DIR .. "tests/lib/util/options.cpp",
 		MAME_DIR .. "tests/emu/attotime.cpp",
 		MAME_DIR .. "tests/emu/video/rgbutil.cpp",
 	}
-
