@@ -94,6 +94,7 @@ private:
 	void rt1715w_set_bank(uint8_t data);
 	void rt1715w_floppy_motor(uint8_t data);
 	void rt1715w_krfd_w(uint8_t data);
+	void rt1715w_chargen_w(uint8_t data);
 	void rt1715_palette(palette_device &palette) const;
 	I8275_DRAW_CHARACTER_MEMBER(crtc_display_pixels);
 	void crtc_drq_w(int state);
@@ -135,6 +136,7 @@ private:
 	u8 m_krfd = 0U;
 	uint16_t m_dma_adr = 0U;
 	int m_r = 0, m_w = 0;
+	bool m_chargen_select = false;
 };
 
 
@@ -246,6 +248,7 @@ void rt1715_state::rt1715_rom_disable(uint8_t data)
 
 MACHINE_START_MEMBER(rt1715_state, rt1715w)
 {
+	save_item(NAME(m_chargen_select));
 }
 
 MACHINE_RESET_MEMBER(rt1715_state, rt1715w)
@@ -255,6 +258,7 @@ MACHINE_RESET_MEMBER(rt1715_state, rt1715w)
 	m_dma_adr = 0;
 	m_r = 0;
 	m_w = 0;
+	m_chargen_select = false;
 }
 
 /*
@@ -421,6 +425,13 @@ void rt1715_state::crtc_drq_w(int state)
 	}
 }
 
+void rt1715_state::rt1715w_chargen_w(uint8_t data)
+{
+	// CRT board A07 latches DB4 as ZG2; E08 XORs it with the 8275 GPA0 output.
+	m_screen->update_partial(m_screen->vpos());
+	m_chargen_select = BIT(data, 4);
+}
+
 I8275_DRAW_CHARACTER_MEMBER(rt1715_state::crtc_display_pixels)
 {
 	using namespace i8275_attributes;
@@ -429,7 +440,7 @@ I8275_DRAW_CHARACTER_MEMBER(rt1715_state::crtc_display_pixels)
 	u8 gfx = BIT(attrcode, LTEN) ? 0xff : 0;
 
 	if (!BIT(attrcode, VSP))
-		gfx = m_p_chargen[(BIT(attrcode, GPA0) ? 0x800 : 0) | (linecount << 7) | charcode];
+		gfx = m_p_chargen[((BIT(attrcode, GPA0) ^ m_chargen_select) ? 0x800 : 0) | (linecount << 7) | charcode];
 
 	if (BIT(attrcode, RVV))
 		gfx ^= 0xff;
@@ -519,7 +530,8 @@ void rt1715_state::rt1715w_io(address_map &map)
 
 	map(0x00, 0x00).rw(m_dma, FUNC(z80dma_device::read), FUNC(z80dma_device::write)); // A2
 	map(0x04, 0x07).rw(m_ctc2, FUNC(z80ctc_device::read), FUNC(z80ctc_device::write)); // A4
-//  map(0x1a, 0x1b) // chargen write protection
+	map(0x1a, 0x1a).w(FUNC(rt1715_state::rt1715w_chargen_w)); // CRT board A07, ZG2
+//  map(0x1b, 0x1b) // CRT board ZRES
 	map(0x1c, 0x1d).m(m_fdc, FUNC(i8272a_device::map));
 	map(0x20, 0x23).w(FUNC(rt1715_state::rt1715w_krfd_w)); // KRFD -- FD-Steuerregister (A45)
 	map(0x24, 0x27).w(FUNC(rt1715_state::rt1715w_set_bank)); // BR (A62, A63)
